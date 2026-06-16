@@ -6,6 +6,7 @@ Extracting features …
 Running KS tests …
 Training Random Forest …
 Computing MMD …
+  RBF gamma (from raw data): 5.3919e-06
 
 ========================================================================
   1. Per-cohort summary statistics (median ± IQR)
@@ -81,8 +82,10 @@ kurtosis    0.007362
 ========================================================================
   4. Maximum Mean Discrepancy (MMD², RBF kernel)
 ========================================================================
+  gamma (RBF bandwidth): 5.3919e-06
                  pair     mmd2
 AUGSBURG vs PRE-RAPID 0.096446
+
 === NORMALISED ===
 Loading cohorts from CUBES-Labelled-COHORTS …
   AUGSBURG: 50 patients
@@ -92,6 +95,7 @@ Extracting features …
 Running KS tests …
 Training Random Forest …
 Computing MMD …
+  RBF gamma (from raw data): 5.3919e-06
 
 ========================================================================
   1. Per-cohort summary statistics (median ± IQR)
@@ -167,5 +171,6 @@ kurtosis    0.036262
 ========================================================================
   4. Maximum Mean Discrepancy (MMD², RBF kernel)
 ========================================================================
+  gamma (RBF bandwidth): 5.3919e-06
                  pair     mmd2
-AUGSBURG vs PRE-RAPID 0.049339
+AUGSBURG vs PRE-RAPID 0.009193

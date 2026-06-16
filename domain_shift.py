@@ -174,15 +174,19 @@ def _rbf_kernel_matrix(X: np.ndarray, Y: np.ndarray, gamma: float) -> np.ndarray
     return np.exp(-gamma * D2)
 
 
+def median_heuristic_gamma(X: np.ndarray, Y: np.ndarray, subsample: int = 200) -> float:
+    """Estimate RBF gamma via the median heuristic on a joint subsample."""
+    sub = np.vstack([X[:subsample], Y[:subsample]])
+    diffs = sub[:, None, :] - sub[None, :, :]
+    median_sq = np.median(np.sum(diffs ** 2, axis=-1))
+    return 1.0 / (2.0 * max(float(median_sq), 1e-8))
+
+
 def mmd_rbf(X: np.ndarray, Y: np.ndarray, gamma: float | None = None) -> float:
     """Unbiased MMD^2 estimate with RBF kernel."""
     n, m = len(X), len(Y)
     if gamma is None:
-        # Median heuristic on a small joint subsample
-        sub = np.vstack([X[:200], Y[:200]])
-        diffs = sub[:, None, :] - sub[None, :, :]
-        median_sq = np.median(np.sum(diffs ** 2, axis=-1))
-        gamma = 1.0 / (2.0 * max(median_sq, 1e-8))
+        gamma = median_heuristic_gamma(X, Y)
 
     Kxx = _rbf_kernel_matrix(X, X, gamma)
     Kyy = _rbf_kernel_matrix(Y, Y, gamma)
@@ -199,7 +203,9 @@ def mmd_rbf(X: np.ndarray, Y: np.ndarray, gamma: float | None = None) -> float:
 
 
 def mmd_analysis(all_cohorts: dict[str, list[PatientVolumes]],
-                 subsample: int | None = None, seed: int = 42) -> pd.DataFrame:
+                 subsample: int | None = None, seed: int = 42,
+                 gamma: float | None = None) -> tuple[pd.DataFrame, float]:
+    """Returns (results_df, gamma_used). Pass gamma to reuse a fixed bandwidth."""
     rng = np.random.default_rng(seed)
     cohort_names = list(all_cohorts.keys())
 
@@ -213,14 +219,24 @@ def mmd_analysis(all_cohorts: dict[str, list[PatientVolumes]],
 
     matrices = {name: _voxel_matrix(plist) for name, plist in all_cohorts.items()}
 
+    # Estimate gamma once from all pairs if not provided
+    if gamma is None:
+        all_pairs = [
+            (cohort_names[i], cohort_names[j])
+            for i in range(len(cohort_names))
+            for j in range(i + 1, len(cohort_names))
+        ]
+        c1, c2 = all_pairs[0]
+        gamma = median_heuristic_gamma(matrices[c1], matrices[c2])
+
     records = []
     for i in range(len(cohort_names)):
         for j in range(i + 1, len(cohort_names)):
             c1, c2 = cohort_names[i], cohort_names[j]
-            val = mmd_rbf(matrices[c1], matrices[c2])
+            val = mmd_rbf(matrices[c1], matrices[c2], gamma=gamma)
             records.append({"pair": f"{c1} vs {c2}", "mmd2": val})
 
-    return pd.DataFrame(records)
+    return pd.DataFrame(records), gamma
 
 
 # ── reporting ─────────────────────────────────────────────────────────────────
@@ -278,7 +294,8 @@ def report(df_feat: pd.DataFrame,
 
     # 4. MMD
     print_section("4. Maximum Mean Discrepancy (MMD², RBF kernel)")
-    print(mmd_df.to_string(index=False))
+    print(f"  gamma (RBF bandwidth): {mmd_df.attrs.get('gamma', 'N/A'):.6g}")
+    print(mmd_df[["pair", "mmd2"]].to_string(index=False))
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -314,7 +331,15 @@ def main() -> None:
     rf = rf_separability(df_feat, seed=args.seed)
 
     print("Computing MMD …")
-    mmd_df = mmd_analysis(all_cohorts, subsample=args.mmd_subsample, seed=args.seed)
+    # Gamma is estimated from the raw cohorts so it is identical whether or not
+    # normalisation is applied, making MMD² values directly comparable.
+    raw_cohorts = load_all_cohorts(root)
+    _, gamma = mmd_analysis(raw_cohorts, subsample=args.mmd_subsample, seed=args.seed)
+    print(f"  RBF gamma (from raw data): {gamma:.6g}")
+
+    mmd_df, _ = mmd_analysis(all_cohorts, subsample=args.mmd_subsample,
+                              seed=args.seed, gamma=gamma)
+    mmd_df.attrs["gamma"] = gamma
 
     report(df_feat, ks_df, rf, mmd_df)
 
