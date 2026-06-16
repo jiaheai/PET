@@ -40,10 +40,9 @@ from normalize import zscore_all_cohorts
 FEATURE_NAMES = [
     "mean", "std", "median", "skewness", "kurtosis",
     "p05", "p25", "p75", "p95",
-    "iqr", "volume",
-    "energy", "entropy",
+    "iqr", "entropy",
     "min", "max",
-]  # 15 features
+]  # 13 features
 
 
 def _entropy(v: np.ndarray, n_bins: int = 64) -> float:
@@ -74,8 +73,6 @@ def extract_features(patient: PatientVolumes) -> dict[str, float]:
         "p75":      float(p75),
         "p95":      float(p95),
         "iqr":      float(iqr),
-        "volume":   float(patient.mask.sum()),   # voxel count
-        "energy":   float(np.sum(voxels ** 2)),
         "entropy":  _entropy(voxels),
         "min":      float(voxels.min()),
         "max":      float(voxels.max()),

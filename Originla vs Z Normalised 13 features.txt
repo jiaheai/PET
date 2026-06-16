@@ -1,0 +1,162 @@
+Loading cohorts from CUBES-Labelled-COHORTS …
+  AUGSBURG: 50 patients
+  PRE-RAPID: 28 patients
+Extracting features …
+Running KS tests …
+Training Random Forest …
+Computing MMD …
+  RBF gamma (from raw data): 5.3919e-06
+
+========================================================================
+  1. Per-cohort summary statistics (median ± IQR)
+========================================================================
+ feature             AUGSBURG         PRE-RAPID
+    mean     2.53  [2.1–2.89] 4.41  [3.92–5.55]
+     std   1.52  [0.905–2.34]  1.95  [1.4–3.48]
+  median    2.15  [1.84–2.46] 3.98  [3.44–4.66]
+skewness   1.56  [0.748–2.43] 1.43  [1.02–1.83]
+kurtosis    3.04  [0.996–9.5]   2.26  [1.2–4.9]
+     p05   0.92  [0.756–1.09] 2.14  [1.92–2.44]
+     p25    1.53  [1.36–1.76] 3.13  [2.79–3.52]
+     p75    2.84  [2.55–3.47]  5.02  [4.63–6.8]
+     p95     5.1  [3.72–6.77] 7.93  [6.61–12.3]
+     iqr    1.32  [1.04–1.78]    2  [1.54–3.21]
+ entropy     4.88  [4.17–5.1] 5.04  [4.49–5.16]
+     min 0.338  [0.224–0.544] 1.19  [1.09–1.34]
+     max    11.7  [6.81–20.5] 17.1  [11.7–24.4]
+
+========================================================================
+  2. KS tests (Bonferroni-corrected α = 0.0038)
+========================================================================
+
+  Pair: AUGSBURG vs PRE-RAPID
+ feature  ks_stat      p_value  significant
+     p05 0.944286 2.913473e-18         True
+     min 0.944286 2.913473e-18         True
+     p25 0.884286 3.407987e-15         True
+  median 0.844286 1.436619e-13         True
+    mean 0.804286 3.822987e-12         True
+     p75 0.788571 1.291946e-11         True
+     p95 0.548571 1.610248e-05         True
+     iqr 0.528571 3.836955e-05         True
+     std 0.404286 3.649340e-03         True
+     max 0.332857 2.778926e-02        False
+skewness 0.237143 2.214233e-01        False
+ entropy 0.224286 2.765142e-01        False
+kurtosis 0.204286 3.813970e-01        False
+
+  Significant features (9): ['mean', 'std', 'median', 'p05', 'p25', 'p75', 'p95', 'iqr', 'min']
+  Non-significant features (4): ['skewness', 'kurtosis', 'entropy', 'max']
+
+========================================================================
+  3. Random Forest cohort separability
+========================================================================
+  Classes : ['AUGSBURG', 'PRE-RAPID']
+  Chance  : 50.0%
+  Folds   : 0.950  0.867  1.000  1.000  1.000
+  Mean BA : 0.963  ± 0.052
+
+  Feature importance (full-data fit):
+ feature  importance
+     min    0.236679
+     p05    0.222960
+     p25    0.177717
+  median    0.116187
+    mean    0.075598
+     p75    0.064890
+     p95    0.028099
+     iqr    0.018725
+ entropy    0.014144
+kurtosis    0.013871
+     std    0.011202
+skewness    0.010148
+     max    0.009780
+
+========================================================================
+  4. Maximum Mean Discrepancy (MMD², RBF kernel)
+========================================================================
+  gamma (RBF bandwidth): 5.3919e-06
+                 pair     mmd2
+AUGSBURG vs PRE-RAPID 0.096446
+---
+Loading cohorts from CUBES-Labelled-COHORTS …
+  AUGSBURG: 50 patients
+  PRE-RAPID: 28 patients
+Applying per-patient z-score normalisation …
+Extracting features …
+Running KS tests …
+Training Random Forest …
+Computing MMD …
+  RBF gamma (from raw data): 5.3919e-06
+
+========================================================================
+  1. Per-cohort summary statistics (median ± IQR)
+========================================================================
+ feature                        AUGSBURG                       PRE-RAPID
+    mean -1.54e-08  [-5.94e-08–4.71e-08] -3.96e-08  [-8.68e-08–4.35e-08]
+     std                        1  [1–1]                        1  [1–1]
+  median         -0.172  [-0.237–-0.108]         -0.216  [-0.266–-0.155]
+skewness              1.56  [0.748–2.43]               1.43  [1.02–1.83]
+kurtosis               3.04  [0.996–9.5]                 2.26  [1.2–4.9]
+     p05           -1.18  [-1.41–-0.897]            -1.15  [-1.31–-1.01]
+     p25          -0.672  [-0.735–-0.59]          -0.671  [-0.71–-0.631]
+     p75            0.454  [0.224–0.587]            0.429  [0.339–0.529]
+     p95               1.81  [1.68–1.94]               1.89  [1.71–2.01]
+     iqr              1.15  [0.839–1.32]              1.12  [0.984–1.23]
+ entropy                4.88  [4.17–5.1]               5.04  [4.49–5.16]
+     min            -1.57  [-1.99–-1.09]            -1.61  [-1.87–-1.35]
+     max               5.54  [4.39–7.29]               4.79  [4.37–6.46]
+
+========================================================================
+  2. KS tests (Bonferroni-corrected α = 0.0038)
+========================================================================
+
+  Pair: AUGSBURG vs PRE-RAPID
+ feature  ks_stat  p_value  significant
+  median 0.245714 0.188500        False
+     p95 0.242857 0.198540        False
+     min 0.237143 0.221423        False
+skewness 0.237143 0.221423        False
+     std 0.232857 0.238370        False
+     p05 0.228571 0.256774        False
+     p75 0.224286 0.276514        False
+ entropy 0.224286 0.276514        False
+     max 0.215714 0.317192        False
+kurtosis 0.204286 0.381397        False
+    mean 0.192857 0.450150        False
+     iqr 0.184286 0.507395        False
+     p25 0.180000 0.535603        False
+
+  Significant features (0): []
+  Non-significant features (13): ['mean', 'std', 'median', 'skewness', 'kurtosis', 'p05', 'p25', 'p75', 'p95', 'iqr', 'entropy', 'min', 'max']
+
+========================================================================
+  3. Random Forest cohort separability
+========================================================================
+  Classes : ['AUGSBURG', 'PRE-RAPID']
+  Chance  : 50.0%
+  Folds   : 0.483  0.667  0.583  0.550  0.550
+  Mean BA : 0.567  ± 0.060
+
+  Feature importance (full-data fit):
+ feature  importance
+ entropy    0.104962
+     p05    0.104623
+     p75    0.101635
+     p25    0.093891
+     min    0.093476
+skewness    0.090808
+  median    0.089475
+     max    0.086190
+     iqr    0.081484
+kurtosis    0.075939
+     p95    0.074444
+    mean    0.003072
+     std    0.000000
+
+========================================================================
+  4. Maximum Mean Discrepancy (MMD², RBF kernel)
+========================================================================
+  gamma (RBF bandwidth): 5.3919e-06
+                 pair     mmd2
+AUGSBURG vs PRE-RAPID 0.009193
