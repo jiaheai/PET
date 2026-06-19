@@ -143,8 +143,7 @@ def train_autoencoder(
                 val_loss += loss.item() * batch.size(0)
         val_loss /= max(len(val_patients), 1)
 
-        if epoch % 10 == 0 or epoch == n_epochs - 1:
-            print(f"epoch {epoch:3d}  train_loss {train_loss:.5f}  val_loss {val_loss:.5f}")
+        print(f"epoch {epoch:3d}  train_loss {train_loss:.5f}  val_loss {val_loss:.5f}")
 
     return model
 
