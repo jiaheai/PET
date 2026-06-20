@@ -202,9 +202,46 @@ def train_autoencoder(
     return model
 
 
+# ── reconstruction ───────────────────────────────────────────────────────────
+
+def save_reconstructions(
+    model: Autoencoder3D,
+    patients: list,
+    out_root: str | Path = "reconstructions",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    """Run all patients through the trained model and save outputs as NIfTI.
+
+    Output layout mirrors the source data:
+        reconstructions/{cohort}/{patient_id}_PET_reconstructed.nii.gz
+    """
+    import nibabel as nib
+    from pathlib import Path as _Path
+
+    out_root = _Path(out_root)
+    model = model.to(device)
+    model.eval()
+
+    with torch.no_grad():
+        for patient in patients:
+            vol = (
+                torch.from_numpy(patient.pet_masked.astype("float32"))
+                .unsqueeze(0).unsqueeze(0)
+                .to(device)
+            )
+            x_hat, _ = model(vol)
+            recon = x_hat.squeeze().cpu().numpy()
+
+            out_dir = out_root / patient.cohort
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{patient.patient_id}_PET_reconstructed.nii.gz"
+            nib.save(nib.Nifti1Image(recon, patient.affine), str(out_path))
+            # print(f"saved {out_path}")
+
+
 if __name__ == "__main__":
     from pathlib import Path
-    from nifti_loader import load_all_cohorts
+    from nifti_loader import load_all_cohorts, PatientVolumes
     from sklearn.model_selection import train_test_split
 
     models_dir = Path("models")
@@ -223,3 +260,5 @@ if __name__ == "__main__":
             model, train_p, val_p, n_epochs=100,
             checkpoint_path=str(models_dir / f"best_autoencoder_{cohort_name}.pt"),
         )
+
+        save_reconstructions(model, patients, out_root=Path("reconstructions"))
