@@ -251,7 +251,7 @@ if __name__ == "__main__":
         print(f"train: {len(train_p)}  val: {len(val_p)}")
         torch.manual_seed(42)
 
-        model = Autoencoder3D(latent_dim=64)
+        model = Autoencoder3D(latent_dim=128)
         model = train_autoencoder(
             model, train_p, val_p, n_epochs=100,
             checkpoint_path=str(models_dir / f"best_autoencoder_{cohort_name}.pt"),
