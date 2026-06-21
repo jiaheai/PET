@@ -25,15 +25,15 @@ class Encoder3D(nn.Module):
         super().__init__()
         # 32^3 -> 16^3 -> 8^3 -> 4^3
         self.conv = nn.Sequential(
-            nn.Conv3d(1, 16, kernel_size=3, stride=2, padding=1),  # 32 -> 16
+            nn.Conv3d(1, 16, kernel_size=4, stride=2, padding=1),  # 32 -> 16
             nn.BatchNorm3d(16),
             nn.ReLU(inplace=True),
 
-            nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1),  # 16 -> 8
+            nn.Conv3d(16, 32, kernel_size=4, stride=2, padding=1),  # 16 -> 8
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
 
-            nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),  # 8 -> 4
+            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1),  # 8 -> 4
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
         )
@@ -52,18 +52,15 @@ class Decoder3D(nn.Module):
         super().__init__()
         self.fc = nn.Linear(latent_dim, 64 * 4 * 4 * 4)
         self.deconv = nn.Sequential(
-            nn.ConvTranspose3d(64, 32, kernel_size=3, stride=2,
-                               padding=1, output_padding=1),  # 4 -> 8
+            nn.ConvTranspose3d(64, 32, kernel_size=4, stride=2, padding=1),  # 4 -> 8
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
 
-            nn.ConvTranspose3d(32, 16, kernel_size=3, stride=2,
-                               padding=1, output_padding=1),  # 8 -> 16
+            nn.ConvTranspose3d(32, 16, kernel_size=4, stride=2, padding=1),  # 8 -> 16
             nn.BatchNorm3d(16),
             nn.ReLU(inplace=True),
 
-            nn.ConvTranspose3d(16, 1, kernel_size=3, stride=2,
-                               padding=1, output_padding=1),  # 16 -> 32
+            nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),   # 16 -> 32
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -71,7 +68,6 @@ class Decoder3D(nn.Module):
         h = h.view(-1, 64, 4, 4, 4)
         x_hat = self.deconv(h)
         return x_hat
-
 
 class Autoencoder3D(nn.Module):
     def __init__(self, latent_dim: int = 64):
@@ -115,7 +111,7 @@ def train_autoencoder(
     batch_size: int = 8,
     lr: float = 1e-3,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    patience: int = 15,
+    patience: int = 35,
     checkpoint_path: str | None = "best_autoencoder.pt",
 ) -> Autoencoder3D:
     """Train the autoencoder, tracking the best validation loss seen.
