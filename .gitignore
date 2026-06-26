@@ -3,3 +3,4 @@ CUBES-Labelled-COHORTS
 __pycache__
 models/
 reconstructions/
+harmonized_reconstructions

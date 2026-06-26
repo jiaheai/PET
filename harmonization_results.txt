@@ -1,0 +1,16 @@
+Best epochs:
+
+lambda = 0.1
+epoch  34  train_loss 1.79780  (recon 1.77443  mmd 0.23368)  val_loss 1.69548  (recon 1.65785  mmd 0.37632)
+
+lambda = 0.5
+epoch  99  train_loss 0.83974  (recon 0.78358  mmd 0.11232)  val_loss 1.77337  (recon 1.66620  mmd 0.21435)
+
+lambda = 1
+epoch  90  train_loss 1.11754  (recon 0.98524  mmd 0.13230)  val_loss 1.99130  (recon 1.74044  mmd 0.25087)
+
+lambda = 5
+epoch  52  train_loss 2.64494  (recon 1.96279  mmd 0.13643)  val_loss 3.06538  (recon 2.27591  mmd 0.15789)
+
+lambda = 10
+epoch  56  train_loss 3.59769  (recon 2.33254  mmd 0.12651)  val_loss 3.62823  (recon 2.41017  mmd 0.12181)

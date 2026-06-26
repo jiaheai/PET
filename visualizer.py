@@ -10,6 +10,10 @@ Side-by-side comparison (original vs reconstruction):
     python visualizer.py --recon
     python visualizer.py --cohort PRE-RAPID --patient 763 --recon
 
+Side-by-side comparison (original vs harmonized reconstruction):
+    python visualizer.py --recon --harmonized
+    python visualizer.py --cohort PRE-RAPID --patient 763 --recon --harmonized
+
 Keyboard controls
 -----------------
   Left / Right arrows (or A / D) : previous / next slice
@@ -30,8 +34,9 @@ import numpy as np
 
 from nifti_loader import PatientVolumes, load_cohort
 
-DATA_ROOT = Path(__file__).parent / "CUBES-Labelled-COHORTS"
-RECON_ROOT = Path(__file__).parent / "reconstructions"
+DATA_ROOT       = Path(__file__).parent / "CUBES-Labelled-COHORTS"
+RECON_ROOT      = Path(__file__).parent / "reconstructions"
+HARMONIZED_ROOT = Path(__file__).parent / "harmonized_reconstructions"
 
 AXIS_LABELS = {0: "X (sagittal)", 1: "Y (coronal)", 2: "Z (axial)"}
 AXIS_KEYS = {"x": 0, "y": 1, "z": 2}
@@ -106,10 +111,12 @@ class CompareViewer:
     the same colour scale and brightness differences are meaningful.
     """
 
-    def __init__(self, original: PatientVolumes, recon: PatientVolumes, axis: int = 2):
+    def __init__(self, original: PatientVolumes, recon: PatientVolumes, axis: int = 2,
+                 recon_label: str = "reconstruction"):
         self.original = original
         self.recon = recon
         self.axis = axis
+        self.recon_label = recon_label
         self.idx = original.pet_masked.shape[axis] // 2
         self.vmax = float(np.nanpercentile(original.pet, 99.5)) or 1.0
 
@@ -127,7 +134,7 @@ class CompareViewer:
         n = self.original.pet_masked.shape[self.axis]
         for ax_obj, vol, label in [
             (self.axes[0], self.original.pet_masked, "original"),
-            (self.axes[1], self.recon.pet_masked,   "reconstruction"),
+            (self.axes[1], self.recon.pet_masked,    self.recon_label),
         ]:
             ax_obj.clear()
             ax_obj.imshow(
@@ -160,10 +167,15 @@ class CompareViewer:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _load_reconstruction(cohort: str, patient_id: str) -> PatientVolumes:
-    path = RECON_ROOT / cohort / f"{patient_id}_PET_reconstructed.nii.gz"
+def _load_reconstruction(cohort: str, patient_id: str, harmonized: bool = False) -> PatientVolumes:
+    if harmonized:
+        path = HARMONIZED_ROOT / cohort / f"{patient_id}_PET_harmonized.nii.gz"
+    else:
+        path = RECON_ROOT / cohort / f"{patient_id}_PET_reconstructed.nii.gz"
+
     if not path.exists():
         raise FileNotFoundError(f"Reconstruction not found: {path}")
+
     img = nib.load(path)
     vol = np.asarray(img.dataobj, dtype=np.float32)
     return PatientVolumes(
@@ -180,13 +192,18 @@ def _load_reconstruction(cohort: str, patient_id: str) -> PatientVolumes:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PET slice viewer")
-    parser.add_argument("--cohort", default="AUGSBURG")
-    parser.add_argument("--patient", default=None, help="Patient ID (default: first in cohort)")
-    parser.add_argument("--axis", default="z", choices=["x", "y", "z"])
-    parser.add_argument("--raw", action="store_true", help="Show raw PET instead of masked")
-    parser.add_argument("--recon", action="store_true",
+    parser.add_argument("--cohort",     default="AUGSBURG")
+    parser.add_argument("--patient",    default=None, help="Patient ID (default: first in cohort)")
+    parser.add_argument("--axis",       default="z", choices=["x", "y", "z"])
+    parser.add_argument("--raw",        action="store_true", help="Show raw PET instead of masked")
+    parser.add_argument("--recon",      action="store_true",
                         help="Show original and reconstruction side-by-side")
+    parser.add_argument("--harmonized", action="store_true",
+                        help="Use harmonized_reconstructions instead of reconstructions (requires --recon)")
     args = parser.parse_args()
+
+    if args.harmonized and not args.recon:
+        parser.error("--harmonized requires --recon")
 
     cohort_dir = DATA_ROOT / args.cohort
     if not cohort_dir.exists():
@@ -216,12 +233,13 @@ def main() -> None:
 
     if args.recon:
         try:
-            recon = _load_reconstruction(args.cohort, patient.patient_id)
+            recon = _load_reconstruction(args.cohort, patient.patient_id, harmonized=args.harmonized)
         except FileNotFoundError as e:
             print(e, file=sys.stderr)
             sys.exit(1)
+        recon_label = "harmonized" if args.harmonized else "reconstruction"
         print(f"  Recon range: [{recon.pet.min():.2f}, {recon.pet.max():.2f}]")
-        CompareViewer(patient, recon, axis=axis).show()
+        CompareViewer(patient, recon, axis=axis, recon_label=recon_label).show()
     else:
         SliceViewer(patient, axis=axis, show_masked=not args.raw).show()
 

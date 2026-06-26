@@ -283,12 +283,12 @@ def train_harmonization(
         val_mmd   /= max(n_val_batches, 1)
         val_loss   = val_recon + lambda_mmd * val_mmd
 
-        if epoch % 10 == 0 or epoch == n_epochs - 1:
-            print(
-                f"epoch {epoch:3d}  "
-                f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.5f})  "
-                f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.5f})"
-            )
+    # if epoch % 10 == 0 or epoch == n_epochs - 1:
+        print(
+            f"epoch {epoch:3d}  "
+            f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.5f})  "
+            f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.5f})"
+        )
 
         # ── checkpointing ─────────────────────────────────────────────
         if val_loss < best_val_loss:
@@ -315,6 +315,51 @@ def train_harmonization(
         model.load_state_dict(best_state)
 
     return model
+
+def save_harmonized_reconstructions(
+    model:    HarmonizationModel,
+    patients: list,
+    cohort:   str,
+    out_root: str | Path = "harmonized_reconstructions",
+    device:   str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    """Run patients through the trained harmonization model and save as NIfTI.
+
+    Output layout:
+        harmonized_reconstructions/{cohort}/{patient_id}_PET_harmonized.nii.gz
+
+    Args:
+        model:    Trained HarmonizationModel.
+        patients: List of PatientVolumes for one cohort.
+        cohort:   Either "AUGSBURG" or "PRE-RAPID" — selects the correct encoder.
+        out_root: Root directory for output files.
+        device:   Device to run inference on.
+    """
+    import nibabel as nib
+    from pathlib import Path as _Path
+
+    out_root = _Path(out_root)
+    model = model.to(device)
+    model.eval()
+
+    encode_fn = model.encode_aug if cohort == "AUGSBURG" else model.encode_pr
+
+    with torch.no_grad():
+        for patient in patients:
+            vol = (
+                torch.from_numpy(patient.pet_masked.astype("float32"))
+                .unsqueeze(0).unsqueeze(0)
+                .to(device)
+            )
+            z     = encode_fn(vol)
+            x_hat = model.decoder(z)
+            recon = x_hat.squeeze().cpu().numpy()
+
+            out_dir = out_root / cohort
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{patient.patient_id}_PET_harmonized.nii.gz"
+            nib.save(nib.Nifti1Image(recon, patient.affine), str(out_path))
+
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -345,6 +390,15 @@ if __name__ == "__main__":
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=100,
-        lambda_mmd=1.0,   # tune this — start at 1.0, watch recon vs mmd components
+        lambda_mmd=10,   # tune this — start at 1.0, watch recon vs mmd components
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
+
+    aug_patients = all_cohorts["AUGSBURG"]
+    pr_patients  = all_cohorts["PRE-RAPID"]
+
+    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=42)
+    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=42)
+
+    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
+    save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID")
