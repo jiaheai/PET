@@ -165,14 +165,16 @@ def compute_mmd(
 # ── dataset ───────────────────────────────────────────────────────────────────
 
 class VolumeDataset(Dataset):
-    def __init__(self, patients: list):
+    def __init__(self, patients: list, scale: float = 1.0):
         self.patients = patients
+        self.scale = scale
 
     def __len__(self) -> int:
         return len(self.patients)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         vol = self.patients[idx].pet_masked.astype("float32")
+        vol = vol / self.scale  # scale to [0, 1] range
         return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
 
 
@@ -212,10 +214,27 @@ def train_harmonization(
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    train_aug_loader = DataLoader(VolumeDataset(train_aug), batch_size=batch_size, shuffle=True)
-    train_pr_loader  = DataLoader(VolumeDataset(train_pr),  batch_size=batch_size, shuffle=True)
-    val_aug_loader   = DataLoader(VolumeDataset(val_aug),   batch_size=batch_size, shuffle=False)
-    val_pr_loader    = DataLoader(VolumeDataset(val_pr),    batch_size=batch_size, shuffle=False)
+    # add this diagnostic before compute_scale
+    for p in train_aug[:3]:
+        print(f"patient {p.patient_id}: pet_masked.max()={p.pet_masked.max():.3f}  pet_masked.shape={p.pet_masked.shape}")
+        
+    # aug_scale = np.percentile(
+    #     [p.pet_masked.max() for p in train_aug], 75
+    # )
+    # pr_scale = np.percentile(
+    #     [p.pet_masked.max() for p in train_pr], 75
+    # )
+
+    aug_scale = 1.0
+    pr_scale = 1.0
+
+    train_aug_loader = DataLoader(VolumeDataset(train_aug, scale=aug_scale), batch_size=batch_size, shuffle=True)
+    train_pr_loader  = DataLoader(VolumeDataset(train_pr, scale=pr_scale),  batch_size=batch_size, shuffle=True)
+    val_aug_loader   = DataLoader(VolumeDataset(val_aug, scale=aug_scale),   batch_size=batch_size, shuffle=False)
+    val_pr_loader    = DataLoader(VolumeDataset(val_pr, scale=pr_scale),    batch_size=batch_size, shuffle=False)
+
+    print(f"AUGSBURG scale: {aug_scale:.4f}")
+    print(f"PRE-RAPID scale: {pr_scale:.4f}")
 
     # To cycle the shorter loader instead of stopping early each epoch,
     # replace zip(...) with zip(train_aug_loader, itertools.cycle(train_pr_loader))
@@ -285,12 +304,12 @@ def train_harmonization(
         val_mmd   /= max(n_val_batches, 1)
         val_loss   = val_recon + lambda_mmd * val_mmd
 
-    # if epoch % 10 == 0 or epoch == n_epochs - 1:
-        print(
-            f"epoch {epoch:3d}  "
-            f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.5f})  "
-            f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.5f})"
-        )
+        if epoch % 10 == 0 or epoch == n_epochs - 1:
+            print(
+                f"epoch {epoch:3d}  "
+                f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.5f})  "
+                f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.5f})"
+            )
 
         # ── checkpointing ─────────────────────────────────────────────
         if val_loss < best_val_loss:
@@ -316,12 +335,13 @@ def train_harmonization(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return model
+    return model, aug_scale, pr_scale
 
 def save_harmonized_reconstructions(
     model:    HarmonizationModel,
     patients: list,
     cohort:   str,
+    scale:     float,
     out_root: str | Path = "harmonized_reconstructions",
     device:   str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
@@ -348,14 +368,15 @@ def save_harmonized_reconstructions(
 
     with torch.no_grad():
         for patient in patients:
+            vol_np = patient.pet_masked.astype("float32") / scale
             vol = (
-                torch.from_numpy(patient.pet_masked.astype("float32"))
+                torch.from_numpy(vol_np)
                 .unsqueeze(0).unsqueeze(0)
                 .to(device)
             )
             z     = encode_fn(vol)
             x_hat = model.decoder(z)
-            recon = x_hat.squeeze().cpu().numpy()
+            recon = x_hat.squeeze().cpu().numpy() * scale
 
             out_dir = out_root / cohort
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -389,17 +410,17 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     model = HarmonizationModel(latent_dim=64)
 
-    model = train_harmonization(
+    model, aug_scale, pr_scale = train_harmonization(
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=100,
-        lambda_mmd=0.001, 
+        lambda_mmd=0.00, 
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
 
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
 
-    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
-    save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID")
+    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG", scale=aug_scale)
+    save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID", scale=pr_scale)
