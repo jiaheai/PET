@@ -16,6 +16,12 @@ Usage
 -----
     python domain_shift.py
     python domain_shift.py --seed 99 --mmd-subsample 40
+
+    # Pin the RBF bandwidth so MMD^2 is comparable across runs
+    # (e.g. raw vs harmonized). Estimate gamma once from the raw run, then
+    # pass the SAME value to every subsequent run:
+    python domain_shift.py --data-root CUBES-Labelled-COHORTS        # note printed gamma
+    python domain_shift.py --data-root harmonized_reconstructions/ --gamma <value>
 """
 
 from __future__ import annotations
@@ -306,6 +312,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mmd-subsample", type=int, default=None,
                         help="Subsample N patients per cohort for MMD (default: use all)")
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Fixed RBF bandwidth for MMD. If unset, estimated via the "
+                             "median heuristic from the raw cohorts. Pass the SAME value "
+                             "across runs to keep MMD² comparable (e.g. raw vs harmonized) "
+                             "— re-estimating gamma per run moves the ruler and the "
+                             "measurement at the same time.")
     args = parser.parse_args()
 
     root = Path(args.data_root)
@@ -313,6 +325,12 @@ def main() -> None:
     all_cohorts = load_all_cohorts(root)
     for name, plist in all_cohorts.items():
         print(f"  {name}: {len(plist)} patients")
+
+    if len(all_cohorts) < 2:
+        raise SystemExit(
+            f"Need ≥2 cohorts for domain-shift analysis, got {list(all_cohorts)}. "
+            f"Check --data-root and file naming."
+        )
 
     if args.normalize:
         print("Applying per-patient z-score normalisation …")
@@ -328,11 +346,17 @@ def main() -> None:
     rf = rf_separability(df_feat, seed=args.seed)
 
     print("Computing MMD …")
-    # Gamma is estimated from the raw cohorts so it is identical whether or not
-    # normalisation is applied, making MMD² values directly comparable.
-    raw_cohorts = load_all_cohorts(root)
-    _, gamma = mmd_analysis(raw_cohorts, subsample=args.mmd_subsample, seed=args.seed)
-    print(f"  RBF gamma (from raw data): {gamma:.6g}")
+    if args.gamma is not None:
+        gamma = args.gamma
+        print(f"  RBF gamma (user-specified): {gamma:.6g}")
+    else:
+        # Gamma is estimated from the raw cohorts so it is identical whether or not
+        # normalisation is applied, making MMD² values directly comparable within
+        # this run. NOTE: it is still re-estimated per data-root — pass --gamma to
+        # pin it across separate runs (e.g. raw vs harmonized).
+        raw_cohorts = load_all_cohorts(root)
+        _, gamma = mmd_analysis(raw_cohorts, subsample=args.mmd_subsample, seed=args.seed)
+        print(f"  RBF gamma (from raw data): {gamma:.6g}")
 
     mmd_df, _ = mmd_analysis(all_cohorts, subsample=args.mmd_subsample,
                               seed=args.seed, gamma=gamma)

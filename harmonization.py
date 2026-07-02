@@ -359,7 +359,7 @@ def save_harmonized_reconstructions(
 
             out_dir = out_root / cohort
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{patient.patient_id}_PET_res_1.nii.gz"
+            out_path = out_dir / f"{patient.patient_id}_PET_harmonized.nii.gz"
             nib.save(nib.Nifti1Image(recon, patient.affine), str(out_path))
             mask_out = out_dir / f"{patient.patient_id}_prostate_mask_res.nii.gz"
             nib.save(nib.Nifti1Image(patient.mask.astype(np.float32), patient.affine), str(mask_out))
@@ -394,15 +394,12 @@ if __name__ == "__main__":
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=100,
-        lambda_mmd=0.5,   # tune this — start at 1.0, watch recon vs mmd components
+        lambda_mmd=0.001, 
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
 
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
-
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=42)
-    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=42)
 
     save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
     save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID")

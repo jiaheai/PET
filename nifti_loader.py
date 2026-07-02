@@ -65,7 +65,7 @@ def load_cohort(cohort_dir: str | Path) -> list[PatientVolumes]:
     if not cohort_dir.is_dir():
         raise FileNotFoundError(f"Cohort directory not found: {cohort_dir}")
 
-    pet_files = sorted(cohort_dir.glob("*_PET_res_*.nii.gz"))
+    pet_files = sorted(cohort_dir.glob("*_PET*.nii.gz"))
     if not pet_files:
         raise FileNotFoundError(f"No PET files found in {cohort_dir}")
 
