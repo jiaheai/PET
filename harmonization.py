@@ -32,6 +32,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -357,8 +359,10 @@ def save_harmonized_reconstructions(
 
             out_dir = out_root / cohort
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{patient.patient_id}_PET_harmonized.nii.gz"
+            out_path = out_dir / f"{patient.patient_id}_PET_res_1.nii.gz"
             nib.save(nib.Nifti1Image(recon, patient.affine), str(out_path))
+            mask_out = out_dir / f"{patient.patient_id}_prostate_mask_res.nii.gz"
+            nib.save(nib.Nifti1Image(patient.mask.astype(np.float32), patient.affine), str(mask_out))
 
 
 
@@ -390,7 +394,7 @@ if __name__ == "__main__":
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=100,
-        lambda_mmd=10,   # tune this — start at 1.0, watch recon vs mmd components
+        lambda_mmd=0.5,   # tune this — start at 1.0, watch recon vs mmd components
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
 
