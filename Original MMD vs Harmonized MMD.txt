@@ -6,4 +6,4 @@ AUGSBURG vs PRE-RAPID 0.096446
 Harmonized:
   gamma (RBF bandwidth): 5.3919e-06
                  pair    mmd2
-AUGSBURG vs PRE-RAPID 0.09955
+AUGSBURG vs PRE-RAPID 0.088266

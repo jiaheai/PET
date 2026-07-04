@@ -214,19 +214,15 @@ def train_harmonization(
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    # add this diagnostic before compute_scale
-    for p in train_aug[:3]:
-        print(f"patient {p.patient_id}: pet_masked.max()={p.pet_masked.max():.3f}  pet_masked.shape={p.pet_masked.shape}")
-        
-    # aug_scale = np.percentile(
-    #     [p.pet_masked.max() for p in train_aug], 75
-    # )
-    # pr_scale = np.percentile(
-    #     [p.pet_masked.max() for p in train_pr], 75
-    # )
+    aug_scale = np.percentile(
+        [p.pet_masked.max() for p in train_aug], 50
+    )
+    pr_scale = np.percentile(
+        [p.pet_masked.max() for p in train_pr], 50
+    )
 
-    aug_scale = 1.0
-    pr_scale = 1.0
+    # aug_scale = 1.0
+    # pr_scale = 1.0
 
     train_aug_loader = DataLoader(VolumeDataset(train_aug, scale=aug_scale), batch_size=batch_size, shuffle=True)
     train_pr_loader  = DataLoader(VolumeDataset(train_pr, scale=pr_scale),  batch_size=batch_size, shuffle=True)
@@ -345,18 +341,6 @@ def save_harmonized_reconstructions(
     out_root: str | Path = "harmonized_reconstructions",
     device:   str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
-    """Run patients through the trained harmonization model and save as NIfTI.
-
-    Output layout:
-        harmonized_reconstructions/{cohort}/{patient_id}_PET_harmonized.nii.gz
-
-    Args:
-        model:    Trained HarmonizationModel.
-        patients: List of PatientVolumes for one cohort.
-        cohort:   Either "AUGSBURG" or "PRE-RAPID" — selects the correct encoder.
-        out_root: Root directory for output files.
-        device:   Device to run inference on.
-    """
     import nibabel as nib
     from pathlib import Path as _Path
 
@@ -414,8 +398,8 @@ if __name__ == "__main__":
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
-        n_epochs=100,
-        lambda_mmd=0.00, 
+        n_epochs=200,
+        lambda_mmd=0, 
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
 

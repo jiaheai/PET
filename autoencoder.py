@@ -15,6 +15,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -230,9 +231,14 @@ def save_reconstructions(
 
             out_dir = out_root / patient.cohort
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{patient.patient_id}_PET_reconstructed.nii.gz"
-            nib.save(nib.Nifti1Image(recon, patient.affine), str(out_path))
-            # print(f"saved {out_path}")
+            nib.save(
+                nib.Nifti1Image(recon, patient.affine),
+                str(out_dir / f"{patient.patient_id}_PET_reconstructed.nii.gz"),
+            )
+            nib.save(
+                nib.Nifti1Image(patient.mask.astype(np.float32), patient.affine),
+                str(out_dir / f"{patient.patient_id}_prostate_mask_res.nii.gz"),
+            )
 
 
 if __name__ == "__main__":
