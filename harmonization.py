@@ -12,14 +12,19 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
+# ── constants ─────────────────────────────────────────────────────────────────
+
+# Gamma from domain_shift.py baseline run on original images.
+# MMD uses this same kernel so training MMD is directly comparable
+# to the reported baseline of 0.096446.
+DOMAIN_SHIFT_GAMMA = 5.3919e-06
+
+
 # ── building blocks ───────────────────────────────────────────────────────────
 
 class Encoder3D(nn.Module):
-    """Shared encoder architecture — instantiated once per cohort."""
-
     def __init__(self, latent_dim: int = 64):
         super().__init__()
-        # 32^3 -> 16^3 -> 8^3 -> 4^3
         self.conv = nn.Sequential(
             nn.Conv3d(1, 16, kernel_size=4, stride=2, padding=1),   # 32 -> 16
             nn.BatchNorm3d(16),
@@ -42,8 +47,6 @@ class Encoder3D(nn.Module):
 
 
 class Decoder3D(nn.Module):
-    """Single shared decoder — reconstructs from the aligned latent space."""
-
     def __init__(self, latent_dim: int = 64):
         super().__init__()
         self.fc = nn.Linear(latent_dim, 64 * 4 * 4 * 4)
@@ -68,12 +71,6 @@ class Decoder3D(nn.Module):
 # ── harmonization model ───────────────────────────────────────────────────────
 
 class HarmonizationModel(nn.Module):
-    """Dual-encoder, shared-decoder harmonization autoencoder.
-
-    Each cohort gets its own encoder (learns site-specific -> shared mapping).
-    One decoder reconstructs from the shared latent space for both cohorts.
-    """
-
     def __init__(self, latent_dim: int = 64):
         super().__init__()
         self.encoder_aug = Encoder3D(latent_dim)
@@ -92,48 +89,28 @@ class HarmonizationModel(nn.Module):
         return x_hat_aug, x_hat_pr, z_aug, z_pr
 
     def encode_aug(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode a single AUGSBURG volume (inference helper)."""
         return self.encoder_aug(x)
 
     def encode_pr(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode a single PRE-RAPID volume (inference helper)."""
         return self.encoder_pr(x)
 
 
 # ── MMD loss ──────────────────────────────────────────────────────────────────
 
-def compute_mmd(
-    z_aug: torch.Tensor,
-    z_pr:  torch.Tensor,
-    sigma: float | None = None,
-) -> torch.Tensor:
-    """RBF-kernel Maximum Mean Discrepancy between two sets of latent vectors.
+def compute_mmd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """RBF-kernel MMD in image space.
 
-    Args:
-        z_aug: (N, latent_dim) latent vectors from AUGSBURG encoder.
-        z_pr:  (M, latent_dim) latent vectors from PRE-RAPID encoder.
-        sigma: RBF bandwidth. If None, uses the median heuristic (median
-               pairwise distance across both sets combined) — a standard,
-               data-adaptive choice.
+    Uses DOMAIN_SHIFT_GAMMA so training MMD is on the same scale as
+    the domain_shift.py evaluation metric (baseline: 0.096446).
 
-    Returns:
-        Scalar MMD² estimate. Zero when distributions are identical;
-        positive otherwise. Differentiable w.r.t. both z_aug and z_pr.
+    x, y: (N, D) and (M, D) — flattened reconstructed volumes.
     """
-    if sigma is None:
-        # Median heuristic: set sigma to median pairwise distance
-        # across the combined set of latent vectors.
-        combined = torch.cat([z_aug, z_pr], dim=0)
-        dists = torch.cdist(combined, combined)
-        sigma = dists.median().item()
-        sigma = max(sigma, 1e-6)   # guard against degenerate case
-
     def rbf(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.exp(-torch.cdist(a, b).pow(2) / (2 * sigma ** 2))
+        return torch.exp(-DOMAIN_SHIFT_GAMMA * torch.cdist(a, b).pow(2))
 
-    kxx = rbf(z_aug, z_aug).mean()
-    kyy = rbf(z_pr,  z_pr ).mean()
-    kxy = rbf(z_aug, z_pr ).mean()
+    kxx = rbf(x, x).mean()
+    kyy = rbf(y, y).mean()
+    kxy = rbf(x, y).mean()
     return kxx + kyy - 2 * kxy
 
 
@@ -149,7 +126,7 @@ class VolumeDataset(Dataset):
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         vol = self.patients[idx].pet_masked.astype("float32")
-        vol = vol / self.scale  # scale to [0, 1] range
+        vol = vol / self.scale
         return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
 
 
@@ -168,49 +145,37 @@ def train_harmonization(
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
     patience:      int   = 35,
     checkpoint_path: str | None = "best_harmonization.pt",
-) -> HarmonizationModel:
-    """Train the dual-encoder harmonization model.
+) -> tuple:
+    """Train dual-encoder harmonization model with image-space MMD.
 
-    Each iteration samples one batch from each cohort, computes:
-      - reconstruction loss for both cohorts
-      - MMD loss between the two cohorts' latent vectors
-      - combined loss = recon + lambda_mmd * MMD
+    MMD is computed on flattened reconstructed volumes using the same
+    gamma as domain_shift.py, so the printed mmd values are directly
+    comparable to the baseline of 0.096446.
 
-    lambda_mmd controls the reconstruction/alignment tradeoff:
-      - too high  → encoders collapse to one point (MMD≈0, reconstruction fails)
-      - too low   → alignment pressure too weak, cohorts stay separated
-      - start at 1.0 and tune based on printed MMD vs recon components
-
-    zip() over the two loaders stops at the shorter one (PRE-RAPID).
-    AUGSBURG's excess batches are skipped each epoch — this is intentional
-    to keep paired (aug, pr) batches for the MMD term. An alternative is
-    to cycle the shorter loader; see comment below if you want that behaviour.
+    Returns (model, aug_scale, pr_scale).
     """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    aug_scale = np.percentile(
-        [p.pet_masked.max() for p in train_aug], 50
-    )
-    pr_scale = np.percentile(
-        [p.pet_masked.max() for p in train_pr], 50
-    )
+    aug_scale = np.percentile([p.pet_masked.max() for p in train_aug], 95)
+    pr_scale  = np.percentile([p.pet_masked.max() for p in train_pr],  95)
 
-    # aug_scale = 1.0
-    # pr_scale = 1.0
+    aug_scale = 1
+    pr_scale  = 1
 
-    train_aug_loader = DataLoader(VolumeDataset(train_aug, scale=aug_scale), batch_size=batch_size, shuffle=True)
-    train_pr_loader  = DataLoader(VolumeDataset(train_pr, scale=pr_scale),  batch_size=batch_size, shuffle=True)
-    val_aug_loader   = DataLoader(VolumeDataset(val_aug, scale=aug_scale),   batch_size=batch_size, shuffle=False)
-    val_pr_loader    = DataLoader(VolumeDataset(val_pr, scale=pr_scale),    batch_size=batch_size, shuffle=False)
-
-    print(f"AUGSBURG scale: {aug_scale:.4f}")
+    print(f"AUGSBURG scale : {aug_scale:.4f}")
     print(f"PRE-RAPID scale: {pr_scale:.4f}")
+    print(f"gamma          : {DOMAIN_SHIFT_GAMMA:.4e}")
+    print(f"baseline MMD   : 0.096446")
 
-    # To cycle the shorter loader instead of stopping early each epoch,
-    # replace zip(...) with zip(train_aug_loader, itertools.cycle(train_pr_loader))
-    # (and import itertools at the top). This uses all of AUGSBURG each epoch
-    # but sees PRE-RAPID patients more than once per epoch.
+    train_aug_loader = DataLoader(
+        VolumeDataset(train_aug, scale=aug_scale), batch_size=batch_size, shuffle=True)
+    train_pr_loader  = DataLoader(
+        VolumeDataset(train_pr,  scale=pr_scale),  batch_size=batch_size, shuffle=True)
+    val_aug_loader   = DataLoader(
+        VolumeDataset(val_aug,   scale=aug_scale), batch_size=batch_size, shuffle=False)
+    val_pr_loader    = DataLoader(
+        VolumeDataset(val_pr,    scale=pr_scale),  batch_size=batch_size, shuffle=False)
 
     best_val_loss        = float("inf")
     best_epoch           = -1
@@ -220,9 +185,9 @@ def train_harmonization(
     for epoch in range(n_epochs):
         # ── training ─────────────────────────────────────────────────
         model.train()
-        train_recon  = 0.0
-        train_mmd    = 0.0
-        n_train      = 0
+        train_recon     = 0.0
+        train_mmd       = 0.0
+        n_train         = 0
         n_train_batches = 0
 
         for batch_aug, batch_pr in zip(train_aug_loader, itertools.cycle(train_pr_loader)):
@@ -233,7 +198,10 @@ def train_harmonization(
             x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
 
             recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
-            mmd   = compute_mmd(z_aug, z_pr)
+            mmd   = compute_mmd(
+                x_hat_aug.flatten(start_dim=1),
+                x_hat_pr.flatten(start_dim=1),
+            )
             loss  = recon + lambda_mmd * mmd
 
             loss.backward()
@@ -251,9 +219,9 @@ def train_harmonization(
 
         # ── validation ───────────────────────────────────────────────
         model.eval()
-        val_recon  = 0.0
-        val_mmd    = 0.0
-        n_val      = 0
+        val_recon     = 0.0
+        val_mmd       = 0.0
+        n_val         = 0
         n_val_batches = 0
 
         with torch.no_grad():
@@ -263,7 +231,10 @@ def train_harmonization(
                 x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
 
                 recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
-                mmd   = compute_mmd(z_aug, z_pr)
+                mmd   = compute_mmd(
+                    x_hat_aug.flatten(start_dim=1),
+                    x_hat_pr.flatten(start_dim=1),
+                )
 
                 n = batch_aug.size(0) + batch_pr.size(0)
                 val_recon += recon.item() * n
@@ -278,11 +249,10 @@ def train_harmonization(
         if epoch % 10 == 0 or epoch == n_epochs - 1:
             print(
                 f"epoch {epoch:3d}  "
-                f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.5f})  "
-                f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.5f})"
+                f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.6f})  "
+                f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.6f})"
             )
 
-        # ── checkpointing ─────────────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss            = val_loss
             best_epoch               = epoch
@@ -293,7 +263,6 @@ def train_harmonization(
         else:
             epochs_since_improvement += 1
 
-        # ── early stopping ────────────────────────────────────────────
         if epochs_since_improvement >= patience:
             print(
                 f"no val_loss improvement for {patience} epochs "
@@ -308,42 +277,53 @@ def train_harmonization(
 
     return model, aug_scale, pr_scale
 
+
+# ── reconstruction saving ─────────────────────────────────────────────────────
+
 def save_harmonized_reconstructions(
     model:    HarmonizationModel,
     patients: list,
     cohort:   str,
-    scale:     float,
+    scale:    float,
     out_root: str | Path = "harmonized_reconstructions",
     device:   str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     import nibabel as nib
     from pathlib import Path as _Path
 
+    if cohort == "AUGSBURG":
+        encode_fn = model.encode_aug
+    elif cohort == "PRE-RAPID":
+        encode_fn = model.encode_pr
+    else:
+        raise ValueError(f"Unknown cohort '{cohort}'. Expected 'AUGSBURG' or 'PRE-RAPID'.")
+
     out_root = _Path(out_root)
     model = model.to(device)
     model.eval()
 
-    encode_fn = model.encode_aug if cohort == "AUGSBURG" else model.encode_pr
-
     with torch.no_grad():
         for patient in patients:
             vol_np = patient.pet_masked.astype("float32") / scale
-            vol = (
-                torch.from_numpy(vol_np)
-                .unsqueeze(0).unsqueeze(0)
-                .to(device)
-            )
+            vol = torch.from_numpy(vol_np).unsqueeze(0).unsqueeze(0).to(device)
+
             z     = encode_fn(vol)
             x_hat = model.decoder(z)
             recon = x_hat.squeeze().cpu().numpy() * scale
 
             out_dir = out_root / cohort
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{patient.patient_id}_PET_harmonized.nii.gz"
-            nib.save(nib.Nifti1Image(recon, patient.affine), str(out_path))
-            mask_out = out_dir / f"{patient.patient_id}_prostate_mask_res.nii.gz"
-            nib.save(nib.Nifti1Image(patient.mask.astype(np.float32), patient.affine), str(mask_out))
 
+            nib.save(
+                nib.Nifti1Image(recon, patient.affine),
+                str(out_dir / f"{patient.patient_id}_PET_harmonized.nii.gz"),
+            )
+            nib.save(
+                nib.Nifti1Image(patient.mask.astype(np.float32), patient.affine),
+                str(out_dir / f"{patient.patient_id}_prostate_mask_res.nii.gz"),
+            )
+
+    print(f"saved {len(patients)} harmonized reconstructions to {out_root / cohort}")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -374,12 +354,9 @@ if __name__ == "__main__":
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=200,
-        lambda_mmd=0, 
+        lambda_mmd=1,
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
-
-    aug_patients = all_cohorts["AUGSBURG"]
-    pr_patients  = all_cohorts["PRE-RAPID"]
 
     save_harmonized_reconstructions(model, aug_patients, "AUGSBURG", scale=aug_scale)
     save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID", scale=pr_scale)

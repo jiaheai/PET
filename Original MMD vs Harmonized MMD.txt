@@ -1,9 +1,5 @@
 Original:
- gamma (RBF bandwidth): 5.3919e-06
-                 pair     mmd2
-AUGSBURG vs PRE-RAPID 0.096446
+0.096446
 
-Harmonized:
-  gamma (RBF bandwidth): 5.3919e-06
-                 pair    mmd2
-AUGSBURG vs PRE-RAPID 0.088266
+Dual encoder recon-MMD approach (no preprocesing):
+0.064077
