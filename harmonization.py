@@ -1,28 +1,3 @@
-"""
-3D autoencoder with MMD-based domain harmonization for 32x32x32 PET VOIs.
-
-Step 2 of the harmonization pipeline: two per-site encoders (AUGSBURG,
-PRE-RAPID) feeding into a shared decoder, with an MMD alignment loss
-pushing the two cohorts' latent distributions together.
-
-Architecture
-------------
-  encoder_aug  ──┐
-                 ├──► shared decoder ──► x_hat_{aug,pr}
-  encoder_pr   ──┘
-       │
-       └──► MMD loss (z_aug vs z_pr)
-
-Loss
-----
-  total = MSE(x_hat_aug, x_aug) + MSE(x_hat_pr, x_pr) + lambda_mmd * MMD(z_aug, z_pr)
-
-The single shared decoder forces both encoders to map into a compatible
-latent space; the MMD term explicitly aligns their distributions.
-
-Run locally (requires torch + your CUBES-Labelled-COHORTS data).
-"""
-
 from __future__ import annotations
 
 import copy
