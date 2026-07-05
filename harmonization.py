@@ -117,16 +117,14 @@ def compute_mmd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # ── dataset ───────────────────────────────────────────────────────────────────
 
 class VolumeDataset(Dataset):
-    def __init__(self, patients: list, scale: float = 1.0):
+    def __init__(self, patients: list):
         self.patients = patients
-        self.scale = scale
 
     def __len__(self) -> int:
         return len(self.patients)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         vol = self.patients[idx].pet_masked.astype("float32")
-        vol = vol / self.scale
         return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
 
 
@@ -145,37 +143,26 @@ def train_harmonization(
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
     patience:      int   = 35,
     checkpoint_path: str | None = "best_harmonization.pt",
-) -> tuple:
+) -> HarmonizationModel:
     """Train dual-encoder harmonization model with image-space MMD.
 
-    MMD is computed on flattened reconstructed volumes using the same
-    gamma as domain_shift.py, so the printed mmd values are directly
-    comparable to the baseline of 0.096446.
+    Raw (unscaled) PET volumes are used throughout. MMD is computed on
+    flattened reconstructed volumes using the same gamma as domain_shift.py,
+    so the printed mmd values are directly comparable to the baseline of
+    0.096446.
 
-    Returns (model, aug_scale, pr_scale).
+    Returns model.
     """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    aug_scale = np.percentile([p.pet_masked.max() for p in train_aug], 95)
-    pr_scale  = np.percentile([p.pet_masked.max() for p in train_pr],  95)
+    print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}")
+    print(f"baseline MMD : 0.096446")
 
-    aug_scale = 1
-    pr_scale  = 1
-
-    print(f"AUGSBURG scale : {aug_scale:.4f}")
-    print(f"PRE-RAPID scale: {pr_scale:.4f}")
-    print(f"gamma          : {DOMAIN_SHIFT_GAMMA:.4e}")
-    print(f"baseline MMD   : 0.096446")
-
-    train_aug_loader = DataLoader(
-        VolumeDataset(train_aug, scale=aug_scale), batch_size=batch_size, shuffle=True)
-    train_pr_loader  = DataLoader(
-        VolumeDataset(train_pr,  scale=pr_scale),  batch_size=batch_size, shuffle=True)
-    val_aug_loader   = DataLoader(
-        VolumeDataset(val_aug,   scale=aug_scale), batch_size=batch_size, shuffle=False)
-    val_pr_loader    = DataLoader(
-        VolumeDataset(val_pr,    scale=pr_scale),  batch_size=batch_size, shuffle=False)
+    train_aug_loader = DataLoader(VolumeDataset(train_aug), batch_size=batch_size, shuffle=True)
+    train_pr_loader  = DataLoader(VolumeDataset(train_pr),  batch_size=batch_size, shuffle=True)
+    val_aug_loader   = DataLoader(VolumeDataset(val_aug),   batch_size=batch_size, shuffle=False)
+    val_pr_loader    = DataLoader(VolumeDataset(val_pr),    batch_size=batch_size, shuffle=False)
 
     best_val_loss        = float("inf")
     best_epoch           = -1
@@ -275,7 +262,7 @@ def train_harmonization(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return model, aug_scale, pr_scale
+    return model
 
 
 # ── reconstruction saving ─────────────────────────────────────────────────────
@@ -284,7 +271,6 @@ def save_harmonized_reconstructions(
     model:    HarmonizationModel,
     patients: list,
     cohort:   str,
-    scale:    float,
     out_root: str | Path = "harmonized_reconstructions",
     device:   str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
@@ -304,12 +290,14 @@ def save_harmonized_reconstructions(
 
     with torch.no_grad():
         for patient in patients:
-            vol_np = patient.pet_masked.astype("float32") / scale
-            vol = torch.from_numpy(vol_np).unsqueeze(0).unsqueeze(0).to(device)
-
+            vol = (
+                torch.from_numpy(patient.pet_masked.astype("float32"))
+                .unsqueeze(0).unsqueeze(0)
+                .to(device)
+            )
             z     = encode_fn(vol)
             x_hat = model.decoder(z)
-            recon = x_hat.squeeze().cpu().numpy() * scale
+            recon = x_hat.squeeze().cpu().numpy()
 
             out_dir = out_root / cohort
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -349,7 +337,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     model = HarmonizationModel(latent_dim=64)
 
-    model, aug_scale, pr_scale = train_harmonization(
+    model = train_harmonization(
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
@@ -358,5 +346,5 @@ if __name__ == "__main__":
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
 
-    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG", scale=aug_scale)
-    save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID", scale=pr_scale)
+    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
+    save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID")
