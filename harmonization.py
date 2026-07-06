@@ -12,11 +12,8 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
-# ── constants ─────────────────────────────────────────────────────────────────
-
-# Gamma from domain_shift.py baseline run on original images.
-# MMD uses this same kernel so training MMD is directly comparable
-# to the reported baseline of 0.096446.
+# ── experiment config ─────────────────────────────────────────────────────────
+DATA_PATH          = "CUBES-Labelled-COHORTS"
 DOMAIN_SHIFT_GAMMA = 5.3919e-06
 
 
@@ -177,7 +174,12 @@ def train_harmonization(
         n_train         = 0
         n_train_batches = 0
 
-        for batch_aug, batch_pr in zip(train_aug_loader, itertools.cycle(train_pr_loader)):
+        if len(train_aug_loader) >= len(train_pr_loader):
+            train_iter = zip(train_aug_loader, itertools.cycle(train_pr_loader))
+        else:
+            train_iter = zip(itertools.cycle(train_aug_loader), train_pr_loader)
+
+        for batch_aug, batch_pr in train_iter:
             batch_aug = batch_aug.to(device)
             batch_pr  = batch_pr.to(device)
 
@@ -211,8 +213,13 @@ def train_harmonization(
         n_val         = 0
         n_val_batches = 0
 
+        if len(val_aug_loader) >= len(val_pr_loader):
+            val_iter = zip(val_aug_loader, itertools.cycle(val_pr_loader))
+        else:
+            val_iter = zip(itertools.cycle(val_aug_loader), val_pr_loader)
+
         with torch.no_grad():
-            for batch_aug, batch_pr in zip(val_aug_loader, val_pr_loader):
+            for batch_aug, batch_pr in val_iter:
                 batch_aug = batch_aug.to(device)
                 batch_pr  = batch_pr.to(device)
                 x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
@@ -323,7 +330,7 @@ if __name__ == "__main__":
     models_dir = Path("models")
     models_dir.mkdir(exist_ok=True)
 
-    all_cohorts = load_all_cohorts(Path("CUBES-Labelled-COHORTS"))
+    all_cohorts = load_all_cohorts(Path(DATA_PATH))
 
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
