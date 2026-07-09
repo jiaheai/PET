@@ -112,7 +112,7 @@ def train_autoencoder(
     batch_size: int = 8,
     lr: float = 1e-3,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    patience: int = 35,
+    patience: int = 50000,
     checkpoint_path: str | None = "best_autoencoder.pt",
 ) -> Autoencoder3D:
     """Train the autoencoder, tracking the best validation loss seen.
@@ -257,9 +257,9 @@ if __name__ == "__main__":
         print(f"train: {len(train_p)}  val: {len(val_p)}")
         torch.manual_seed(42)
 
-        model = Autoencoder3D(latent_dim=128)
+        model = Autoencoder3D(latent_dim=64)
         model = train_autoencoder(
-            model, train_p, val_p, n_epochs=100,
+            model, train_p, val_p, n_epochs=300,
             checkpoint_path=str(models_dir / f"best_autoencoder_{cohort_name}.pt"),
         )
 

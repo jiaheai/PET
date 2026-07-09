@@ -6,13 +6,18 @@ Directory layout expected:
     {patient_id}_PET_res_{N}.nii.gz
     {patient_id}_prostate_mask_res.nii.gz
 
+Where present, the trailing {N} in the PET filename is the risk label
+(0 = low risk, 1 = high risk) and is loaded into PatientVolumes.label.
+Directories without labelled filenames (e.g. harmonized_reconstructions)
+yield patients with label=None.
+
 Usage
 -----
     from nifti_loader import load_cohort, load_patient
 
     patients = load_cohort("CUBES-Labelled-COHORTS/AUGSBURG")
     for p in patients:
-        print(p.patient_id, p.pet_masked.shape)
+        print(p.patient_id, p.label, p.pet_masked.shape)
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ class PatientVolumes:
     mask: np.ndarray         # binary prostate mask, shape (X, Y, Z)
     pet_masked: np.ndarray   # PET with outside-mask voxels zeroed
     affine: np.ndarray       # voxel-to-world affine from the PET image
+    label: int | None        # risk label (0 = low, 1 = high); None if unlabelled
 
 
 def load_patient(pet_path: Path, mask_path: Path) -> PatientVolumes:
@@ -49,6 +55,7 @@ def load_patient(pet_path: Path, mask_path: Path) -> PatientVolumes:
 
     patient_id = _patient_id_from_path(pet_path)
     cohort = pet_path.parent.name
+    label = _label_from_path(pet_path)
 
     return PatientVolumes(
         patient_id=patient_id,
@@ -57,6 +64,7 @@ def load_patient(pet_path: Path, mask_path: Path) -> PatientVolumes:
         mask=binary_mask,
         pet_masked=pet_masked,
         affine=pet_img.affine,
+        label=label,
     )
 
 
@@ -101,6 +109,7 @@ def load_all_cohorts(root_dir: str | Path) -> dict[str, list[PatientVolumes]]:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 _PET_ID_RE = re.compile(r"^(\d+)_PET_res_")
+_PET_LABEL_RE = re.compile(r"^\d+_PET_res_(\d+)\.nii\.gz$")
 
 
 def _patient_id_from_path(pet_path: Path) -> str:
@@ -109,3 +118,8 @@ def _patient_id_from_path(pet_path: Path) -> str:
         return m.group(1)
     # Fallback: strip known suffixes
     return pet_path.name.split("_PET")[0]
+
+
+def _label_from_path(pet_path: Path) -> int | None:
+    m = _PET_LABEL_RE.match(pet_path.name)
+    return int(m.group(1)) if m else None

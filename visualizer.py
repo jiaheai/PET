@@ -29,7 +29,6 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import nibabel as nib
 import numpy as np
 
 from nifti_loader import PatientVolumes, load_cohort
@@ -168,24 +167,15 @@ class CompareViewer:
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _load_reconstruction(cohort: str, patient_id: str, harmonized: bool = False) -> PatientVolumes:
-    if harmonized:
-        path = HARMONIZED_ROOT / cohort / f"{patient_id}_PET_harmonized.nii.gz"
-    else:
-        path = RECON_ROOT / cohort / f"{patient_id}_PET_reconstructed.nii.gz"
+    root = HARMONIZED_ROOT if harmonized else RECON_ROOT
+    cohort_dir = root / cohort
+    if not cohort_dir.exists():
+        raise FileNotFoundError(f"Reconstruction directory not found: {cohort_dir}")
 
-    if not path.exists():
-        raise FileNotFoundError(f"Reconstruction not found: {path}")
-
-    img = nib.load(path)
-    vol = np.asarray(img.dataobj, dtype=np.float32)
-    return PatientVolumes(
-        patient_id=patient_id,
-        cohort=cohort,
-        pet=vol,
-        mask=None,
-        pet_masked=vol,
-        affine=img.affine,
-    )
+    match = [p for p in load_cohort(cohort_dir) if p.patient_id == patient_id]
+    if not match:
+        raise FileNotFoundError(f"No reconstruction found for patient {patient_id} in {cohort_dir}")
+    return match[0]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

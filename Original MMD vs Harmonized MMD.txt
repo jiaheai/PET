@@ -1,5 +1,0 @@
-Original:
-0.096446
-
-Dual encoder recon-MMD approach (no preprocesing):
-0.064077

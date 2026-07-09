@@ -57,6 +57,7 @@ class Decoder3D(nn.Module):
             nn.ReLU(inplace=True),
 
             nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),   # 16 -> 32
+            nn.ReLU(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -138,7 +139,7 @@ def train_harmonization(
     lr:            float = 1e-3,
     lambda_mmd:    float = 1.0,
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
-    patience:      int   = 35,
+    patience:      int   = 50000,
     checkpoint_path: str | None = "best_harmonization.pt",
 ) -> HarmonizationModel:
     """Train dual-encoder harmonization model with image-space MMD.
@@ -311,7 +312,7 @@ def save_harmonized_reconstructions(
 
             nib.save(
                 nib.Nifti1Image(recon, patient.affine),
-                str(out_dir / f"{patient.patient_id}_PET_harmonized.nii.gz"),
+                str(out_dir / f"{patient.patient_id}_PET_res_{patient.label}.nii.gz"),
             )
             nib.save(
                 nib.Nifti1Image(patient.mask.astype(np.float32), patient.affine),
@@ -348,7 +349,7 @@ if __name__ == "__main__":
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
-        n_epochs=200,
+        n_epochs=300,
         lambda_mmd=1,
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )

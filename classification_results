@@ -1,0 +1,23 @@
+Plain autoencoder
+latent matrix (78, 64)  positives 42  negatives 36
+fold 0  n_test 16  acc 0.812  auc 0.778
+fold 1  n_test 16  acc 0.750  auc 0.698
+fold 2  n_test 16  acc 0.500  auc 0.531
+fold 3  n_test 15  acc 0.600  auc 0.696
+fold 4  n_test 15  acc 0.600  auc 0.750
+
+mean acc 0.653 ± 0.113
+mean auc 0.691 ± 0.086
+pooled confusion matrix  tn 28  fp 8  fn 19  tp 23
+
+Harmonization model
+latent matrix (78, 64)  positives 42  negatives 36
+fold 0  n_test 16  acc 0.688  auc 0.667
+fold 1  n_test 16  acc 0.688  auc 0.651
+fold 2  n_test 16  acc 0.625  auc 0.641
+fold 3  n_test 15  acc 0.800  auc 0.911
+fold 4  n_test 15  acc 0.733  auc 0.661
+
+mean acc 0.707 ± 0.058
+mean auc 0.706 ± 0.103
+pooled confusion matrix  tn 28  fp 8  fn 15  tp 27
