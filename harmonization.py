@@ -139,7 +139,7 @@ def train_harmonization(
     lr:            float = 1e-3,
     lambda_mmd:    float = 1.0,
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
-    patience:      int   = 50000,
+    patience:      int   = 10,
     checkpoint_path: str | None = "best_harmonization.pt",
 ) -> HarmonizationModel:
     """Train dual-encoder harmonization model with image-space MMD.
@@ -336,11 +336,24 @@ if __name__ == "__main__":
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
 
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=42)
-    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=42)
+    train_aug, val_aug = train_test_split(aug_patients, test_size=0.3, random_state=42)
+    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.3, random_state=42)
 
     print(f"AUGSBURG : {len(train_aug)} train / {len(val_aug)} val")
     print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val")
+
+    # ── persist the val split, so downstream scripts (e.g. classifier.py)
+    # can identify encoder-unseen patients without re-deriving the split
+    # (which is fragile if patient list ordering ever differs between runs).
+    import json
+    val_ids_path = models_dir / "val_patient_ids.json"
+    val_ids = {
+        "AUGSBURG":  [p.patient_id for p in val_aug],
+        "PRE-RAPID": [p.patient_id for p in val_pr],
+    }
+    with open(val_ids_path, "w") as f:
+        json.dump(val_ids, f, indent=2)
+    print(f"saved val patient IDs to {val_ids_path}")
 
     torch.manual_seed(42)
     model = HarmonizationModel(latent_dim=64)
@@ -349,7 +362,7 @@ if __name__ == "__main__":
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
-        n_epochs=300,
+        n_epochs=50,
         lambda_mmd=1,
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
