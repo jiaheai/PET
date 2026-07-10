@@ -21,6 +21,7 @@ import argparse
 from copy import copy
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
 import pandas as pd
 
@@ -60,37 +61,65 @@ def zscore_all_cohorts(
     return {name: zscore_cohort(plist) for name, plist in all_cohorts.items()}
 
 
-# ── comparison report ─────────────────────────────────────────────────────────
+# ── saving volumes ────────────────────────────────────────────────────────────
+#
+# Output layout mirrors save_reconstructions() in the autoencoder script:
+# out_root/<cohort>/{patient_id}_PET_zscore.nii.gz + {patient_id}_prostate_mask_res.nii.gz
 
-def _summarise(all_cohorts: dict[str, list[PatientVolumes]]) -> pd.DataFrame:
-    rows = []
-    for cohort, patients in all_cohorts.items():
-        for p in patients:
-            voxels = p.pet_masked[p.mask].astype(np.float64)
-            if voxels.size == 0:
-                continue
-            rows.append({
-                "cohort":    cohort,
-                "patient_id": p.patient_id,
-                "mean":      voxels.mean(),
-                "std":       voxels.std(),
-                "min":       voxels.min(),
-                "max":       voxels.max(),
-            })
-    return pd.DataFrame(rows)
+def save_normalized_cohort(
+    patients: list[PatientVolumes],
+    out_root: str | Path,
+) -> None:
+    """Write each patient's z-score normalised PET *and* its prostate mask
+    into out_root/<cohort>/, mirroring save_reconstructions()'s layout:
+
+        out_root/{cohort}/{patient_id}_PET_zscore.nii.gz
+        out_root/{cohort}/{patient_id}_prostate_mask_res.nii.gz
+    """
+    out_root = Path(out_root)
+
+    for p in patients:
+        out_dir = out_root / p.cohort
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        nib.save(
+            nib.Nifti1Image(p.pet_masked, p.affine),
+            str(out_dir / f"{p.patient_id}_PET_zscore.nii.gz"),
+        )
+        nib.save(
+            nib.Nifti1Image(p.mask.astype(np.float32), p.affine),
+            str(out_dir / f"{p.patient_id}_prostate_mask_res.nii.gz"),
+        )
 
 
-def _cohort_stats(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby("cohort")[["mean", "std", "min", "max"]]
-        .agg(["mean", "std"])
-        .round(4)
-    )
+def save_normalized_all_cohorts(
+    all_cohorts: dict[str, list[PatientVolumes]], out_root: str | Path
+) -> None:
+    for plist in all_cohorts.values():
+        save_normalized_cohort(plist, out_root)
+
+
+def save_original_cohort(patients: list[PatientVolumes], output_dir: str | Path) -> None:
+    """Write each patient's original (un-normalised) PET into output_dir/<cohort>/."""
+    output_dir = Path(output_dir)
+    for p in patients:
+        cohort_dir = output_dir / p.cohort
+        cohort_dir.mkdir(parents=True, exist_ok=True)
+        img = nib.Nifti1Image(p.pet, p.affine)
+        nib.save(img, cohort_dir / f"{p.patient_id}_PET_res.nii.gz")
+
+
+def save_original_all_cohorts(
+    all_cohorts: dict[str, list[PatientVolumes]], output_dir: str | Path
+) -> None:
+    for plist in all_cohorts.values():
+        save_original_cohort(plist, output_dir)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Z-score normalisation demo")
     parser.add_argument("--data-root", default="CUBES-Labelled-COHORTS")
+    parser.add_argument("--output-dir", default="CUBES-Labelled-COHORTS-ZSCORE")
     args = parser.parse_args()
 
     root = Path(args.data_root)
@@ -102,18 +131,8 @@ def main() -> None:
     print("\nApplying per-patient z-score normalisation …")
     normed_cohorts = zscore_all_cohorts(all_cohorts)
 
-    before = _summarise(all_cohorts)
-    after  = _summarise(normed_cohorts)
-
-    print("\n── Before normalisation ─────────────────────────────────────────")
-    print(_cohort_stats(before).to_string())
-
-    print("\n── After normalisation ──────────────────────────────────────────")
-    print(_cohort_stats(after).to_string())
-
-    print("\n── Per-patient mean/std after normalisation (should be ≈ 0 / 1) ─")
-    check = after.groupby("cohort")[["mean", "std"]].agg(["min", "max"]).round(6)
-    print(check.to_string())
+    print(f"\nSaving normalised volumes (+ masks) to {args.output_dir} …")
+    save_normalized_all_cohorts(normed_cohorts, args.output_dir)
 
 
 if __name__ == "__main__":
