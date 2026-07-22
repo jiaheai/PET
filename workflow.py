@@ -28,7 +28,7 @@ TORCH_SEED     = 42                # fixed -- model init/training stochasticity 
 N_EPOCHS       = 1000
 RESULTS_PATH   = Path("sweep_results.jsonl")
 
-TUNE_THRESHOLD = True   # False -> use the sklearn default of 0.5 everywhere
+TUNE_THRESHOLD = False   # False -> use the sklearn default of 0.5 everywhere
 
 
 def load_existing_results() -> dict[int, dict]:
