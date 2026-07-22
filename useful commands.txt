@@ -2,8 +2,7 @@ PRE-RAPID sample patient:
 python visualizer.py --harmonized --recon --cohort PRE-RAPID --patient 808
 
 AUGSBURG sample patient:
-python visualizer.py --harmonized --recon --cohort AUGSBURG --patient 699
-python visualizer.py --harmonized --recon --cohort AUGSBURG --patient 692
+python visualizer.py --harmonized --recon --cohort PRE-RAPID --patient 763
 
 Domain shift test on harmonized data:
 python domain_shift.py --gamma 5.3919e-06 --data-root harmonized_reconstructions/

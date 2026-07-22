@@ -139,7 +139,7 @@ def train_harmonization(
     lr:            float = 1e-3,
     lambda_mmd:    float = 1.0,
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
-    patience:      int   = 10,
+    patience:      int   = 200,
     checkpoint_path: str | None = "best_harmonization.pt",
 ) -> HarmonizationModel:
     """Train dual-encoder harmonization model with image-space MMD.
@@ -323,7 +323,6 @@ def save_harmonized_reconstructions(
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     from nifti_loader import load_all_cohorts
     from sklearn.model_selection import train_test_split
@@ -336,36 +335,45 @@ if __name__ == "__main__":
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
 
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.3, random_state=42)
-    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.3, random_state=42)
+    # ── three-way split: train / val / test ─────────────────────────────
+    # test is held out entirely from train_harmonization (no backprop,
+    # no checkpoint selection) — only touched at inference time below.
+    trainval_aug, test_aug = train_test_split(aug_patients, test_size=0.2, random_state=40)
+    train_aug,    val_aug  = train_test_split(trainval_aug, test_size=0.25, random_state=40)  # 0.25*0.8=0.2
 
-    print(f"AUGSBURG : {len(train_aug)} train / {len(val_aug)} val")
-    print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val")
+    trainval_pr, test_pr = train_test_split(pr_patients, test_size=0.2, random_state=40)
+    train_pr,    val_pr  = train_test_split(trainval_pr, test_size=0.25, random_state=40)
 
-    # ── persist the val split, so downstream scripts (e.g. classifier.py)
-    # can identify encoder-unseen patients without re-deriving the split
-    # (which is fragile if patient list ordering ever differs between runs).
-    import json
-    val_ids_path = models_dir / "val_patient_ids.json"
-    val_ids = {
-        "AUGSBURG":  [p.patient_id for p in val_aug],
-        "PRE-RAPID": [p.patient_id for p in val_pr],
-    }
-    with open(val_ids_path, "w") as f:
-        json.dump(val_ids, f, indent=2)
-    print(f"saved val patient IDs to {val_ids_path}")
+    print(f"AUGSBURG : {len(train_aug)} train / {len(val_aug)} val / {len(test_aug)} test")
+    print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val / {len(test_pr)} test")
 
-    torch.manual_seed(42)
+    test_ids_path = models_dir / "test_patient_ids.txt"
+    with open(test_ids_path, "w") as f:
+        for p in test_aug + test_pr:
+            f.write(f"{p.cohort}\t{p.patient_id}\n")
+    print(f"saved {len(test_aug) + len(test_pr)} test patient ids to {test_ids_path}")
+
+    torch.manual_seed(41)
     model = HarmonizationModel(latent_dim=64)
 
     model = train_harmonization(
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
-        n_epochs=50,
+        n_epochs=1000,
         lambda_mmd=1,
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
 
-    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
-    save_harmonized_reconstructions(model, pr_patients,  "PRE-RAPID")
+    # ── save reconstructions, keeping test split separate ──────────────
+    # trainval reconstructions: for fitting the downstream classifier
+    save_harmonized_reconstructions(model, train_aug + val_aug, "AUGSBURG",
+                                     out_root="harmonized_reconstructions/trainval")
+    save_harmonized_reconstructions(model, train_pr + val_pr, "PRE-RAPID",
+                                     out_root="harmonized_reconstructions/trainval")
+
+    # test reconstructions: encoder never trained/selected on these patients
+    save_harmonized_reconstructions(model, test_aug, "AUGSBURG",
+                                     out_root="harmonized_reconstructions/test")
+    save_harmonized_reconstructions(model, test_pr, "PRE-RAPID",
+                                     out_root="harmonized_reconstructions/test")

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
 
 import joblib
@@ -15,7 +13,17 @@ from sklearn.preprocessing import StandardScaler
 
 from harmonization import HarmonizationModel
 
-DATA_PATH = "CUBES-Labelled-COHORTS"
+DATA_PATH        = "CUBES-Labelled-COHORTS"
+CHECKPOINT_PATH  = "models/best_harmonization.pt"
+TEST_IDS_PATH    = "models/test_patient_ids.txt"
+LATENT_DIM       = 64
+FULL_N_SPLITS    = 5
+RANDOM_STATE     = 42
+OUT_CLASSIFIER   = "models/latent_logreg.joblib"
+
+TRAIN_COHORT     = "AUGSBURG"    # cohort used to fit the classifier
+HOLDOUT_COHORT   = "PRE-RAPID"   # cohort evaluated as the generalization test
+
 _ENCODE_FN_BY_COHORT = {
     "AUGSBURG": "encode_aug",
     "PRE-RAPID": "encode_pr",
@@ -49,32 +57,6 @@ def encode_patients(
             zs.append(z)
             ys.append(patient.label)
     return np.stack(zs), np.array(ys)
-
-
-def load_val_patients(
-    aug_patients: list, pr_patients: list, val_ids_path: str | Path
-) -> list:
-    """Return only the patients present in val_patient_ids.json (never
-    seen by gradient descent during encoder training)."""
-    with open(val_ids_path) as f:
-        val_ids = json.load(f)
-
-    val_aug_ids = set(val_ids["AUGSBURG"])
-    val_pr_ids = set(val_ids["PRE-RAPID"])
-
-    val_aug = [p for p in aug_patients if p.patient_id in val_aug_ids]
-    val_pr = [p for p in pr_patients if p.patient_id in val_pr_ids]
-
-    # sanity check — if these don't match, the JSON is stale or patient_id
-    # values don't line up between runs (e.g. reloaded/renamed data).
-    if len(val_aug) != len(val_aug_ids):
-        missing = val_aug_ids - {p.patient_id for p in val_aug}
-        print(f"WARNING: {len(missing)} AUGSBURG val IDs not found in loaded patients: {missing}")
-    if len(val_pr) != len(val_pr_ids):
-        missing = val_pr_ids - {p.patient_id for p in val_pr}
-        print(f"WARNING: {len(missing)} PRE-RAPID val IDs not found in loaded patients: {missing}")
-
-    return val_aug + val_pr
 
 
 # ── evaluation ────────────────────────────────────────────────────────────────
@@ -132,78 +114,84 @@ def evaluate_cv(
     }
 
 
-def run_evaluation(
-    model: HarmonizationModel,
-    patients: list,
-    label: str,
-    n_splits: int = 5,
-    random_state: int = 42,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Encode a patient list, print latent-matrix summary, and run CV.
-
-    Single entry point so full-pool and val-only evaluations share one
-    code path instead of duplicating encode+print+evaluate at each call
-    site.
-    """
-    Z, y = encode_patients(model, patients)
-    print(f"\n{label} latent matrix {Z.shape}  positives {int(y.sum())}  negatives {int((1 - y).sum())}")
-    stats = evaluate_cv(Z, y, n_splits=n_splits, random_state=random_state, label=label.upper())
-    return Z, y, stats
+def eval_on(model, final_clf, label: str, plist: list) -> None:
+    """Apply an already-fit classifier to a fixed patient list (no refitting)."""
+    if not plist:
+        print(f"\n=== {label} ===\n(no patients)")
+        return
+    Z, y = encode_patients(model, plist)
+    y_pred = final_clf.predict(Z)
+    y_prob = final_clf.predict_proba(Z)[:, 1]
+    acc = accuracy_score(y, y_pred)
+    auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
+    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
+    print(f"\n=== {label} ===")
+    print(f"n {len(plist)}  acc {acc:.3f}  auc {auc:.3f}")
+    print(f"confusion matrix  tn {tn}  fp {fp}  fn {fn}  tp {tp}")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Latent-space risk classifier CV")
-    parser.add_argument("--data-path", default=DATA_PATH)
-    parser.add_argument("--checkpoint", default="models/best_harmonization.pt")
-    parser.add_argument("--val-ids-path", default="models/val_patient_ids.json")
-    parser.add_argument("--latent-dim", type=int, default=64)
-    parser.add_argument("--full-n-splits", type=int, default=5)
-    parser.add_argument("--val-n-splits", type=int, default=3)
-    parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument("--out-classifier", default="models/latent_logreg.joblib")
-    args = parser.parse_args()
-
+if __name__ == "__main__":
     from nifti_loader import load_all_cohorts
 
-    models_dir = Path(args.checkpoint).parent
+    models_dir = Path(CHECKPOINT_PATH).parent
     models_dir.mkdir(exist_ok=True)
 
-    model = HarmonizationModel(latent_dim=args.latent_dim)
-    model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    model = HarmonizationModel(latent_dim=LATENT_DIM)
+    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location="cpu"))
     model.eval()
 
-    cohorts = load_all_cohorts(Path(args.data_path))
-    aug_patients = cohorts["AUGSBURG"]
-    pr_patients = cohorts["PRE-RAPID"]
-    patients = aug_patients + pr_patients
-    print(f"loaded {len(patients)} patients from {list(cohorts.keys())}")
+    cohorts = load_all_cohorts(Path(DATA_PATH))
 
-    # ── full pool (includes encoder-train patients) ────────────────────────
-    Z_all, y_all, full_stats = run_evaluation(
-        model, patients, "full pool (includes encoder-train patients)",
-        n_splits=args.full_n_splits, random_state=args.random_state,
-    )
+    for name in (TRAIN_COHORT, HOLDOUT_COHORT):
+        if name not in cohorts:
+            raise ValueError(
+                f"Cohort '{name}' not found. Available cohorts: {list(cohorts.keys())}"
+            )
 
-    # ── val-only pool (never touched by gradient descent) ──────────────────
-    eval_patients = load_val_patients(aug_patients, pr_patients, args.val_ids_path)
-    Z_val, y_val, val_stats = run_evaluation(
-        model, eval_patients, "val-only pool (encoder-untrained-on patients)",
-        n_splits=args.val_n_splits, random_state=args.random_state,
-    )
+    # ── load the test-patient keys saved during harmonization training ──
+    # NOTE: this file and CHECKPOINT_PATH must come from the same
+    # harmonization training run — if you retrain with a different split
+    # or dataset version, regenerate this file too, or the "held-out"
+    # evaluation below will be silently wrong (encoder may have trained
+    # on patients this script treats as unseen).
+    test_ids_path = Path(TEST_IDS_PATH)
+    if not test_ids_path.exists():
+        raise FileNotFoundError(
+            f"{test_ids_path} not found — run harmonization.py first to "
+            f"generate the train/val/test split and save test patient ids."
+        )
+    with open(test_ids_path) as f:
+        test_keys = set(tuple(line.strip().split("\t")) for line in f if line.strip())
 
-    print(
-        f"\nsummary: full acc {full_stats['mean_acc']:.3f} vs "
-        f"val-only acc {val_stats['mean_acc']:.3f}"
-    )
+    all_patients = [p for plist in cohorts.values() for p in plist]
 
-    # final classifier fit on all pooled latents, for downstream use
+    test_patients     = [p for p in all_patients if (p.cohort, p.patient_id) in test_keys]
+    trainval_patients = [p for p in all_patients if (p.cohort, p.patient_id) not in test_keys]
+
+    train_patients = [p for p in trainval_patients if p.cohort == TRAIN_COHORT]
+    test_train_cohort   = [p for p in test_patients if p.cohort == TRAIN_COHORT]
+    test_holdout_cohort = [p for p in test_patients if p.cohort == HOLDOUT_COHORT]
+
+    print(f"loaded {len(all_patients)} patients total")
+    print(f"training on {TRAIN_COHORT} trainval ({len(train_patients)} patients)")
+    print(f"held-out test — {TRAIN_COHORT}: {len(test_train_cohort)}  "
+          f"{HOLDOUT_COHORT}: {len(test_holdout_cohort)}")
+
+    # ── fit on train cohort's trainval patients only ────────────────────
+    Z_train, y_train = encode_patients(model, train_patients)
+    print(f"\ntrain latent matrix {Z_train.shape}  positives {int(y_train.sum())}  negatives {int((1 - y_train).sum())}")
+
+    # CV within the training cohort's trainval set, sanity-check it's learnable at all
+    train_cv_stats = evaluate_cv(Z_train, y_train, n_splits=FULL_N_SPLITS, random_state=RANDOM_STATE, label="TRAIN-COHORT CV")
+
     final_clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
-    final_clf.fit(Z_all, y_all)
-    joblib.dump(final_clf, args.out_classifier)
-    print(f"saved final classifier to {args.out_classifier}")
+    final_clf.fit(Z_train, y_train)
+    joblib.dump(final_clf, OUT_CLASSIFIER)
+    print(f"saved final classifier to {OUT_CLASSIFIER}")
 
-
-if __name__ == "__main__":
-    main()
+    # ── evaluate on true held-out test patients ──────────────────────────
+    eval_on(model, final_clf, f"HELD-OUT COHORT ({HOLDOUT_COHORT} test)", test_holdout_cohort)
+    eval_on(model, final_clf, f"TRAIN COHORT, held-out ({TRAIN_COHORT} test)", test_train_cohort)
+    eval_on(model, final_clf, "ALL TEST PATIENTS COMBINED", test_patients)
