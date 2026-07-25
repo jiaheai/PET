@@ -35,7 +35,7 @@ from nifti_loader import PatientVolumes, load_cohort
 
 DATA_ROOT       = Path(__file__).parent / "CUBES-Labelled-COHORTS"
 RECON_ROOT      = Path(__file__).parent / "reconstructions"
-HARMONIZED_ROOT = Path(__file__).parent / "harmonized_reconstructions/test"
+HARMONIZED_ROOT = Path(__file__).parent / "harmonized_reconstructions"
 
 AXIS_LABELS = {0: "X (sagittal)", 1: "Y (coronal)", 2: "Z (axial)"}
 AXIS_KEYS = {"x": 0, "y": 1, "z": 2}

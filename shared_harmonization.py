@@ -17,7 +17,7 @@ DATA_PATH          = "CUBES-Labelled-COHORTS"
 DOMAIN_SHIFT_GAMMA = 5.3919e-06
 
 
-# -- building blocks ------------------------------------------------------------
+# -- building blocks (identical to harmonization.py) ------------------------------
 
 class Encoder3D(nn.Module):
     def __init__(self, latent_dim: int = 64):
@@ -66,34 +66,46 @@ class Decoder3D(nn.Module):
         return self.deconv(h)
 
 
-# -- harmonization model ------------------------------------------------------
+# -- harmonization model -- OPTION A: SHARED ENCODER + SHARED DECODER -------------
+# Only structural difference from harmonization.py's HarmonizationModel:
+# ONE Encoder3D instead of two (encoder_aug/encoder_pr). Both cohorts'
+# volumes are pushed through the exact same encoder weights. MMD is still
+# used to encourage z_aug/z_pr to look alike, but now the same function
+# produces both -- there's no separate per-cohort specialization for MMD
+# to reconcile, the sharing is baked into the architecture itself.
 
-class HarmonizationModel(nn.Module):
+class HarmonizationModelShared(nn.Module):
     def __init__(self, latent_dim: int = 64):
         super().__init__()
-        self.encoder_aug = Encoder3D(latent_dim)
-        self.encoder_pr  = Encoder3D(latent_dim)
-        self.decoder     = Decoder3D(latent_dim)
+        self.encoder = Encoder3D(latent_dim)   # single shared encoder
+        self.decoder = Decoder3D(latent_dim)
 
     def forward(
         self,
         x_aug: torch.Tensor,
         x_pr:  torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        z_aug = self.encoder_aug(x_aug)
-        z_pr  = self.encoder_pr(x_pr)
+        z_aug = self.encoder(x_aug)
+        z_pr  = self.encoder(x_pr)
         x_hat_aug = self.decoder(z_aug)
         x_hat_pr  = self.decoder(z_pr)
         return x_hat_aug, x_hat_pr, z_aug, z_pr
 
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Single encode method -- same function regardless of cohort."""
+        return self.encoder(x)
+
+    # Aliases so classifier.py's _ENCODE_FN_BY_COHORT lookup pattern keeps
+    # working unchanged if you point it at this model: both cohort names
+    # resolve to the same underlying encoder call.
     def encode_aug(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder_aug(x)
+        return self.encoder(x)
 
     def encode_pr(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder_pr(x)
+        return self.encoder(x)
 
 
-# -- MMD loss ------------------------------------------------------------
+# -- MMD loss (identical to harmonization.py) --------------------------------------
 
 def compute_mmd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """RBF-kernel MMD in image space.
@@ -112,7 +124,7 @@ def compute_mmd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return kxx + kyy - 2 * kxy
 
 
-# -- dataset ------------------------------------------------------------
+# -- dataset (identical to harmonization.py) ---------------------------------------
 
 class VolumeDataset(Dataset):
     def __init__(self, patients: list):
@@ -127,9 +139,13 @@ class VolumeDataset(Dataset):
 
 
 # -- training loop ------------------------------------------------------------
+# Identical structure to harmonization.py's train_harmonization -- same
+# recon + MMD loss combination, same early stopping. Only the model
+# class changed (HarmonizationModelShared instead of HarmonizationModel),
+# and forward() now routes both cohorts through the same encoder weights.
 
-def train_harmonization(
-    model:         HarmonizationModel,
+def train_harmonization_shared(
+    model:         HarmonizationModelShared,
     train_aug:     list,
     val_aug:       list,
     train_pr:      list,
@@ -140,14 +156,13 @@ def train_harmonization(
     lambda_mmd:    float = 1.0,
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
     patience:      int   = 200,
-    checkpoint_path: str | None = "best_harmonization.pt",
-) -> HarmonizationModel:
-    """Train dual-encoder harmonization model with image-space MMD.
+    checkpoint_path: str | None = "best_harmonization_shared.pt",
+) -> HarmonizationModelShared:
+    """Train single-shared-encoder harmonization model with image-space MMD.
 
-    Raw (unscaled) PET volumes are used throughout. MMD is computed on
-    flattened reconstructed volumes using the same gamma as domain_shift.py,
-    so the printed mmd values are directly comparable to the baseline of
-    0.096446.
+    Same loss structure as harmonization.py's train_harmonization
+    (recon + lambda_mmd * mmd, same DOMAIN_SHIFT_GAMMA), so results are
+    directly comparable to the dual-encoder (Option B) baseline.
 
     Returns model.
     """
@@ -274,22 +289,20 @@ def train_harmonization(
 
 
 # -- reconstruction saving ------------------------------------------------------
+# Identical to harmonization.py, but cohort no longer selects between two
+# different encoders -- both cohorts call the same model.encode().
 
 def save_harmonized_reconstructions(
-    model:    HarmonizationModel,
+    model:    HarmonizationModelShared,
     patients: list,
     cohort:   str,
-    out_root: str | Path = "harmonized_reconstructions",
+    out_root: str | Path = "harmonized_reconstructions_shared",
     device:   str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     import nibabel as nib
     from pathlib import Path as _Path
 
-    if cohort == "AUGSBURG":
-        encode_fn = model.encode_aug
-    elif cohort == "PRE-RAPID":
-        encode_fn = model.encode_pr
-    else:
+    if cohort not in ("AUGSBURG", "PRE-RAPID"):
         raise ValueError(f"Unknown cohort '{cohort}'. Expected 'AUGSBURG' or 'PRE-RAPID'.")
 
     out_root = _Path(out_root)
@@ -303,7 +316,7 @@ def save_harmonized_reconstructions(
                 .unsqueeze(0).unsqueeze(0)
                 .to(device)
             )
-            z     = encode_fn(vol)
+            z     = model.encode(vol)   # same encoder for both cohorts
             x_hat = model.decoder(z)
             recon = x_hat.squeeze().cpu().numpy()
 
@@ -335,15 +348,7 @@ if __name__ == "__main__":
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
 
-    # -- train / val split only --------------------------------------------
-    # No held-out test carve-out: every patient in both cohorts
-    # contributes to training. val is used purely for early stopping /
-    # checkpoint selection (best val_loss) -- it is not excluded from the
-    # "closed cohort" the downstream classifier will later evaluate on.
-    # Per supervisor's instructions: harmonization may see all data;
-    # only the downstream classifier needs a held-out cohort (handled
-    # separately in classifier.py, which trains on all of AUGSBURG and
-    # tests on all of PRE-RAPID).
+    # -- train / val split only, same policy as harmonization.py ------------
     train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=40)
     train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=40)
 
@@ -351,21 +356,16 @@ if __name__ == "__main__":
     print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val  (all {len(pr_patients)} used)")
 
     torch.manual_seed(41)
-    model = HarmonizationModel(latent_dim=64)
+    model = HarmonizationModelShared(latent_dim=64)
 
-    model = train_harmonization(
+    model = train_harmonization_shared(
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=1000,
         lambda_mmd=1,
-        checkpoint_path=str(models_dir / "best_harmonization.pt"),
+        checkpoint_path=str(models_dir / "best_harmonization_shared.pt"),
     )
 
-    # -- save reconstructions for the whole cohort ---------------------------
-    # kept for domain_shift.py diagnostics; classifier.py itself doesn't
-    # read from here (it encodes raw volumes directly).
-    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG",
-                                     out_root="harmonized_reconstructions")
-    save_harmonized_reconstructions(model, pr_patients, "PRE-RAPID",
-                                     out_root="harmonized_reconstructions")
+    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
+    save_harmonized_reconstructions(model, pr_patients, "PRE-RAPID")
