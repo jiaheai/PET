@@ -142,15 +142,6 @@ def train_harmonization(
     patience:      int   = 200,
     checkpoint_path: str | None = "best_harmonization.pt",
 ) -> HarmonizationModel:
-    """Train dual-encoder harmonization model with image-space MMD.
-
-    Raw (unscaled) PET volumes are used throughout. MMD is computed on
-    flattened reconstructed volumes using the same gamma as domain_shift.py,
-    so the printed mmd values are directly comparable to the baseline of
-    0.096446.
-
-    Returns model.
-    """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
@@ -335,15 +326,6 @@ if __name__ == "__main__":
     aug_patients = all_cohorts["AUGSBURG"]
     pr_patients  = all_cohorts["PRE-RAPID"]
 
-    # -- train / val split only --------------------------------------------
-    # No held-out test carve-out: every patient in both cohorts
-    # contributes to training. val is used purely for early stopping /
-    # checkpoint selection (best val_loss) -- it is not excluded from the
-    # "closed cohort" the downstream classifier will later evaluate on.
-    # Per supervisor's instructions: harmonization may see all data;
-    # only the downstream classifier needs a held-out cohort (handled
-    # separately in classifier.py, which trains on all of AUGSBURG and
-    # tests on all of PRE-RAPID).
     train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=40)
     train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=40)
 
@@ -361,10 +343,7 @@ if __name__ == "__main__":
         lambda_mmd=1,
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
-
-    # -- save reconstructions for the whole cohort ---------------------------
-    # kept for domain_shift.py diagnostics; classifier.py itself doesn't
-    # read from here (it encodes raw volumes directly).
+    
     save_harmonized_reconstructions(model, aug_patients, "AUGSBURG",
                                      out_root="harmonized_reconstructions")
     save_harmonized_reconstructions(model, pr_patients, "PRE-RAPID",
