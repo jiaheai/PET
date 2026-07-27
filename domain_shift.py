@@ -39,7 +39,6 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
 from nifti_loader import PatientVolumes, load_all_cohorts
-from normalize import zscore_all_cohorts
 
 # ── feature extraction ────────────────────────────────────────────────────────
 
@@ -331,10 +330,6 @@ def main() -> None:
             f"Need ≥2 cohorts for domain-shift analysis, got {list(all_cohorts)}. "
             f"Check --data-root and file naming."
         )
-
-    if args.normalize:
-        print("Applying per-patient z-score normalisation …")
-        all_cohorts = zscore_all_cohorts(all_cohorts)
 
     print("Extracting features …")
     df_feat = build_feature_df(all_cohorts)

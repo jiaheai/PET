@@ -11,7 +11,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from harmonization import HarmonizationModel
+from b import HarmonizationModel
 
 DATA_PATH        = "CUBES-Labelled-COHORTS"
 CHECKPOINT_PATH  = "models/best_harmonization.pt"

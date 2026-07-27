@@ -192,6 +192,55 @@ def eval_on(model: CNNClassifier3D, label: str, plist: list,
             "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
 
 
+def zscore_shift_correct(prob_source: np.ndarray, prob_target: np.ndarray) -> np.ndarray:
+    """Align target cohort's predicted-probability distribution to the
+    source cohort's, via z-score matching (mean/std only).
+
+    Uses ONLY the two cohorts' probability distributions -- no labels
+    from either cohort touch this computation, so it's legitimate under
+    the "never use test labels" rule. This corrects for a shift/scale
+    difference in the model's calibration between cohorts (e.g. from
+    an underlying intensity-distribution shift), not for a difference
+    in true class balance -- if the cohorts' true prevalence genuinely
+    differs, this will partially flatten that real difference too, so
+    treat corrected results as an approximation, not exact.
+
+    prob_source: probabilities from the cohort whose scale we want to
+                 match (typically the training cohort, e.g. AUGSBURG).
+    prob_target: probabilities from the cohort being corrected
+                 (typically the held-out cohort, e.g. PRE-RAPID).
+    """
+    z = (prob_target - prob_target.mean()) / prob_target.std()
+    return z * prob_source.std() + prob_source.mean()
+
+
+def eval_on_probs(y: np.ndarray, y_prob: np.ndarray, label: str, threshold: float = 0.5) -> dict:
+    """Same metrics as eval_on, but takes precomputed (y, y_prob) arrays
+    directly instead of re-running the model -- used for evaluating
+    corrected probabilities that didn't come straight from the model."""
+    if len(y) == 0:
+        print(f"\n=== {label} ===\n(no patients)")
+        return {}
+    y_pred = (y_prob >= threshold).astype(int)
+
+    acc  = accuracy_score(y, y_pred)
+    bacc = balanced_accuracy_score(y, y_pred)
+    auc  = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
+    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
+    recall_pos = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    recall_neg = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+
+    print(f"\n=== {label} (threshold={threshold:.3f}) ===")
+    print(f"n {len(y)}  acc {acc:.3f}  bal. acc {bacc:.3f}  auc {auc:.3f}")
+    print(f"recall(pos) {recall_pos:.3f}  recall(neg) {recall_neg:.3f}")
+    print(f"confusion matrix  tn {tn}  fp {fp}  fn {fn}  tp {tp}")
+    print(f"prob range: [{y_prob.min():.3f}, {y_prob.max():.3f}]  mean {y_prob.mean():.3f}")
+
+    return {"acc": acc, "bacc": bacc, "auc": auc,
+            "recall_pos": recall_pos, "recall_neg": recall_neg,
+            "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+
+
 # -- entry point ------------------------------------------------------------
 if __name__ == "__main__":
     from nifti_loader import load_all_cohorts
@@ -219,3 +268,27 @@ if __name__ == "__main__":
 
     eval_on(model, f"HELD-OUT COHORT ({HOLDOUT_COHORT}, all patients)", pr_patients)
     eval_on(model, f"TRAIN COHORT, in-sample ({TRAIN_COHORT}, all patients)", aug_patients)
+
+    # -- z-score shift correction: uses only unlabeled probability -------
+    # distributions from both cohorts, no PRE-RAPID labels touched.
+    def get_probs(plist, device="cuda" if torch.cuda.is_available() else "cpu"):
+        model.eval()
+        ys, probs = [], []
+        with torch.no_grad():
+            for p in plist:
+                vol = torch.from_numpy(p.pet_masked.astype("float32")).unsqueeze(0).unsqueeze(0).to(device)
+                probs.append(torch.sigmoid(model(vol)).item())
+                ys.append(p.label)
+        return np.array(probs), np.array(ys)
+
+    prob_aug, y_aug = get_probs(aug_patients)
+    prob_pr,  y_pr  = get_probs(pr_patients)
+
+    prob_pr_corrected = zscore_shift_correct(prob_source=prob_aug, prob_target=prob_pr)
+
+    print("\n--- z-score shift correction (PRE-RAPID probs matched to AUGSBURG's mean/std) ---")
+    print(f"PRE-RAPID probs before: [{prob_pr.min():.3f}, {prob_pr.max():.3f}]  mean {prob_pr.mean():.3f}")
+    print(f"PRE-RAPID probs after:  [{prob_pr_corrected.min():.3f}, {prob_pr_corrected.max():.3f}]  "
+          f"mean {prob_pr_corrected.mean():.3f}")
+    eval_on_probs(y_pr, prob_pr_corrected,
+                  f"HELD-OUT COHORT ({HOLDOUT_COHORT}, z-score corrected)", threshold=0.5)

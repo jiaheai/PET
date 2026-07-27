@@ -1,0 +1,53 @@
+1. CNN
+auc             : 0.853 +/- 0.025 
+bal acc         : 0.599 +/- 0.116
+recall(+)       : 0.916 +/- 0.144
+recall(-)       : 0.282 +/- 0.351
+
+2. CNN + prob norm
+auc       : 0.853 +/- 0.025
+bal acc   : 0.759 +/- 0.039
+recall(+) : 0.645 +/- 0.151
+recall(-) : 0.873 +/- 0.146
+
+3. Z + CNN
+
+4. Histogram + CNN
+
+5. Single encoder + logReg
+auc            : 0.688 +/- 0.083
+recall(pos)    : 0.400 +/- 0.160
+recall(neg)    : 0.942 +/- 0.083
+balanced acc   : 0.671 +/- 0.074
+
+6. Single encoder + logReg + prob norm
+auc            : 0.688 +/- 0.083
+recall(pos)    : 0.512 +/- 0.106
+recall(neg)    : 0.848 +/- 0.127
+balanced acc   : 0.680 +/- 0.090
+
+7. Z + Single encoder
+
+8. Histogram + Single encoder
+
+9. Dual encoder single decoder + logReg
+balanced acc   : 0.674 +/- 0.082
+auc            : 0.689 +/- 0.079
+recall(pos)    : 0.408 +/- 0.156
+recall(neg)    : 0.939 +/- 0.086
+
+10. Dual encoder single decoder + logReg + prob norm
+balanced acc   : 0.674 +/- 0.082
+auc            : 0.689 +/- 0.079
+recall(pos)    : 0.408 +/- 0.156
+recall(neg)    : 0.939 +/- 0.086
+
+11. Z + Dual encoder
+
+12. Histogram + Dual encoder
+
+13. Separate autoencoders + concat classification
+bal acc     : 0.702 +/- 0.057
+auc         : 0.807 +/- 0.052
+recall(pos) : 0.792 +/- 0.064
+recall(neg) : 0.612 +/- 0.102
