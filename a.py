@@ -74,7 +74,7 @@ class Decoder3D(nn.Module):
 # produces both -- there's no separate per-cohort specialization for MMD
 # to reconcile, the sharing is baked into the architecture itself.
 
-class HarmonizationModelShared(nn.Module):
+class HarmonizationModel(nn.Module):
     def __init__(self, latent_dim: int = 64):
         super().__init__()
         self.encoder = Encoder3D(latent_dim)   # single shared encoder
@@ -141,11 +141,11 @@ class VolumeDataset(Dataset):
 # -- training loop ------------------------------------------------------------
 # Identical structure to harmonization.py's train_harmonization -- same
 # recon + MMD loss combination, same early stopping. Only the model
-# class changed (HarmonizationModelShared instead of HarmonizationModel),
+# class changed (HarmonizationModel instead of HarmonizationModel),
 # and forward() now routes both cohorts through the same encoder weights.
 
-def train_harmonization_shared(
-    model:         HarmonizationModelShared,
+def train_harmonization(
+    model:         HarmonizationModel,
     train_aug:     list,
     val_aug:       list,
     train_pr:      list,
@@ -157,7 +157,7 @@ def train_harmonization_shared(
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
     patience:      int   = 200,
     checkpoint_path: str | None = "best_harmonization_shared.pt",
-) -> HarmonizationModelShared:
+) -> HarmonizationModel:
     """Train single-shared-encoder harmonization model with image-space MMD.
 
     Same loss structure as harmonization.py's train_harmonization
@@ -293,7 +293,7 @@ def train_harmonization_shared(
 # different encoders -- both cohorts call the same model.encode().
 
 def save_harmonized_reconstructions(
-    model:    HarmonizationModelShared,
+    model:    HarmonizationModel,
     patients: list,
     cohort:   str,
     out_root: str | Path = "harmonized_reconstructions_shared",
@@ -356,9 +356,9 @@ if __name__ == "__main__":
     print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val  (all {len(pr_patients)} used)")
 
     torch.manual_seed(41)
-    model = HarmonizationModelShared(latent_dim=64)
+    model = HarmonizationModel(latent_dim=64)
 
-    model = train_harmonization_shared(
+    model = train_harmonization(
         model,
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,

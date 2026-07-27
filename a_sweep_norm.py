@@ -11,7 +11,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from b import HarmonizationModel, train_harmonization
+from a import HarmonizationModel, train_harmonization
 from classifier import encode_patients
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
@@ -20,11 +20,11 @@ DATA_PATH      = "CUBES-Labelled-COHORTS"
 TRAIN_COHORT   = "AUGSBURG"    # entire cohort -- always the classifier's training set
 HOLDOUT_COHORT = "PRE-RAPID"   # entire cohort -- always the classifier's test set
 
-TORCH_SEEDS  = list(range(30))  
+TORCH_SEEDS  = list(range(30))   # 0..9 -- init/training-stochasticity sweep
 VAL_FRACTION = 0.2               # per-cohort val split, used only for early stopping
 VAL_SPLIT_SEED = 40              # fixed -- keeps the same val patients across all torch seeds
 N_EPOCHS     = 1000
-RESULTS_PATH = Path("b_sweep_norm_results.jsonl")
+RESULTS_PATH = Path("a_sweep_norm_results.jsonl")
 
 
 def load_existing_results() -> dict[int, dict]:

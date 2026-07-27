@@ -1,13 +1,5 @@
 """
-Option C: center-specific encoder/decoder pairs, every patient pushed
-through BOTH pairs to get 2 latent spaces, concatenated into one
-feature vector per patient for the downstream classifier.
-
-Unlike harmonization.py (Option B), there is no cross-cohort loss here
-(no MMD) -- each encoder/decoder pair is trained independently, purely
-to reconstruct its OWN cohort's images well. The two encoders never
-"talk" to each other during training; whatever relationship exists
-between their latent spaces at test time is incidental, not enforced.
+build 2 autoencoders, then train one classifier on the concat latent space of all augsburg, and test on concat of all pre rapid
 """
 
 from __future__ import annotations
