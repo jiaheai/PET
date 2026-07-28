@@ -1,30 +1,4 @@
 """
-Cohort-level histogram matching for PET volumes.
-
-Unlike normalize.py's per-patient z-score normalization (which
-destroyed each patient's absolute intensity information and, with it,
-apparently the classification signal itself -- see CNN results after
-per-patient normalization: probabilities collapsed to a ~0.02-wide
-band, AUC dropped below chance), this operates at the COHORT level:
-
-  - Pool all within-mask voxels from every AUGSBURG patient together
-    into one big reference distribution.
-  - Pool all within-mask voxels from every PRE-RAPID patient together.
-  - Map PRE-RAPID's pooled distribution onto AUGSBURG's, percentile by
-    percentile (histogram matching), using ONE shared mapping function
-    for every PRE-RAPID patient.
-
-This corrects the cohort-level intensity shift (the actual target)
-while preserving each patient's relative intensity differences from
-other patients in their own cohort -- unlike per-patient normalization,
-no single patient's own distribution is used to normalize themselves,
-so absolute intensity differences between patients within a cohort are
-NOT erased.
-
-AUGSBURG's own volumes are saved UNCHANGED (they define the reference
-distribution; there's nothing to correct them against). Only PRE-RAPID
-is transformed.
-
 Usage
 -----
     python histogram_match.py --data-root CUBES-Labelled-COHORTS \\
