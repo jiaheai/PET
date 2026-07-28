@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # -- experiment config ------------------------------------------------------------
-DATA_PATH          = "CUBES-Labelled-COHORTS"
+DATA_PATH          = "CUBES-Labelled-COHORTS-ZSCORE"
 DOMAIN_SHIFT_GAMMA = 5.3919e-06
 
 

@@ -1,9 +1,7 @@
 CUBES-Labelled-COHORTS
-.claude
 __pycache__
 models/
-reconstructions/
 harmonized_reconstructions
 harmonized_reconstructions_shared
 CUBES-Labelled-COHORTS-ZSCORE
-todo
+CUBES-Labelled-COHORTS-HISTMATCH

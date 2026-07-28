@@ -16,7 +16,7 @@ from classifier import encode_patients
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
-DATA_PATH      = "CUBES-Labelled-COHORTS"
+DATA_PATH      = "CUBES-Labelled-COHORTS-HISTMATCH"
 TRAIN_COHORT   = "AUGSBURG"    # entire cohort -- always the classifier's training set
 HOLDOUT_COHORT = "PRE-RAPID"   # entire cohort -- always the classifier's test set
 

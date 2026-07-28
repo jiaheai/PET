@@ -25,7 +25,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-DATA_PATH = "CUBES-Labelled-COHORTS"
+DATA_PATH = "CUBES-Labelled-COHORTS-ZSCORE"
 TRAIN_COHORT   = "AUGSBURG"
 HOLDOUT_COHORT = "PRE-RAPID"
 

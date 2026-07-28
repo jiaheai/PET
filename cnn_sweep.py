@@ -24,7 +24,7 @@ from cnn import (
 )
 from nifti_loader import load_all_cohorts
 
-DATA_PATH      = "CUBES-Labelled-COHORTS"
+DATA_PATH      = "CUBES-Labelled-COHORTS-HISTMATCH"
 TRAIN_COHORT   = "AUGSBURG"
 HOLDOUT_COHORT = "PRE-RAPID"
 
@@ -32,7 +32,7 @@ LATENT_DIM    = 16               # fixed -- 16-dim beat 64-dim in the earlier 5-
 TORCH_SEEDS   = list(range(30))  # 0..29 -- matches the 30-seed convention used for harmonization sweeps
 VAL_SPLIT_SEED = 40          # fixed -- same AUGSBURG train/val split across all runs
 N_EPOCHS      = 200
-RESULTS_PATH  = Path("cnn__sweep_results.jsonl")
+RESULTS_PATH  = Path("cnn_sweep_results.jsonl")
 
 
 def get_probs(model, plist, device="cuda" if torch.cuda.is_available() else "cpu"):
