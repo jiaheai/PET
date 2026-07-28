@@ -30,7 +30,7 @@ from cnn import zscore_shift_correct   # reuse the same correction used for the 
 # Defaults -- overridable via --data-path / --results-path for automation
 # (e.g. running the same sweep against raw / -ZSCORE / -HISTMATCH data
 # without editing this file each time).
-DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS-HISTMATCH"
+DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "c_sweep_norm_results.jsonl"
 
 TRAIN_COHORT   = "AUGSBURG"
