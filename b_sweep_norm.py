@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -16,30 +17,49 @@ from classifier import encode_patients
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
-DATA_PATH      = "CUBES-Labelled-COHORTS-HISTMATCH"
+# Defaults -- overridable via --data-path / --results-path for automation
+# (e.g. running the same sweep against raw / -ZSCORE / -HISTMATCH data
+# without editing this file each time).
+DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
+DEFAULT_RESULTS_PATH = "b_sweep_norm_results.jsonl"
+
 TRAIN_COHORT   = "AUGSBURG"    # entire cohort -- always the classifier's training set
 HOLDOUT_COHORT = "PRE-RAPID"   # entire cohort -- always the classifier's test set
 
-TORCH_SEEDS  = list(range(30))  
-VAL_FRACTION = 0.2               # per-cohort val split, used only for early stopping
-VAL_SPLIT_SEED = 40              # fixed -- keeps the same val patients across all torch seeds
-N_EPOCHS     = 1000
-RESULTS_PATH = Path("b_sweep_norm_results.jsonl")
+TORCH_SEEDS    = list(range(30))
+VAL_FRACTION   = 0.2               # per-cohort val split, used only for early stopping
+VAL_SPLIT_SEED = 40                # fixed -- keeps the same val patients across all torch seeds
+N_EPOCHS       = 1000
 
 
-def load_existing_results() -> dict[int, dict]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Option B sweep (30 seeds, with z-score correction)")
+    parser.add_argument(
+        "--data-path", default=DEFAULT_DATA_PATH,
+        help=f"Directory containing AUGSBURG/PRE-RAPID cohort data (default: {DEFAULT_DATA_PATH})",
+    )
+    parser.add_argument(
+        "--results-path", default=DEFAULT_RESULTS_PATH,
+        help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}). "
+             "Use a distinct path per data variant so results from different "
+             "preprocessing (raw/z-score/histogram-match) don't get mixed together.",
+    )
+    return parser.parse_args()
+
+
+def load_existing_results(results_path: Path) -> dict[int, dict]:
     """Load already-completed seed results, keyed by torch seed, so a rerun can skip them.
 
     NOTE: this version adds "holdout_cohort_corrected" to each result.
-    If RESULTS_PATH was written by an earlier version of this script
+    If results_path was written by an earlier version of this script
     (missing that field, or the older "threshold" field), delete it
     before rerunning -- summarize() will KeyError on the missing field
     otherwise.
     """
-    if not RESULTS_PATH.exists():
+    if not results_path.exists():
         return {}
     results = {}
-    with open(RESULTS_PATH) as f:
+    with open(results_path) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -49,8 +69,8 @@ def load_existing_results() -> dict[int, dict]:
     return results
 
 
-def append_result(r: dict) -> None:
-    with open(RESULTS_PATH, "a") as f:
+def append_result(r: dict, results_path: Path) -> None:
+    with open(results_path, "a") as f:
         f.write(json.dumps(r) + "\n")
 
 
@@ -58,6 +78,7 @@ def run_one_seed(torch_seed: int, all_cohorts: dict) -> dict:
     aug_patients = all_cohorts[TRAIN_COHORT]     # all 50
     pr_patients  = all_cohorts[HOLDOUT_COHORT]   # all 28
 
+    # stratified so val doesn't accidentally end up class-skewed at n~10
     train_aug, val_aug = train_test_split(
         aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
         stratify=[p.label for p in aug_patients],
@@ -142,11 +163,18 @@ def summarize(results: list, key: str, label: str) -> None:
 
 
 if __name__ == "__main__":
-    all_cohorts = load_all_cohorts(Path(DATA_PATH))
+    args = parse_args()
+    data_path = Path(args.data_path)
+    results_path = Path(args.results_path)
 
-    existing = load_existing_results()
+    print(f"data path    : {data_path}")
+    print(f"results path : {results_path}")
+
+    all_cohorts = load_all_cohorts(data_path)
+
+    existing = load_existing_results(results_path)
     if existing:
-        print(f"found {len(existing)} completed torch seed(s) in {RESULTS_PATH}, will skip those: "
+        print(f"found {len(existing)} completed torch seed(s) in {results_path}, will skip those: "
               f"{sorted(existing.keys())}")
 
     results = []
@@ -157,7 +185,7 @@ if __name__ == "__main__":
 
         print(f"\n{'='*60}\nTORCH SEED {torch_seed}\n{'='*60}")
         r = run_one_seed(torch_seed, all_cohorts)
-        append_result(r)   # persist immediately, so a crash doesn't lose this seed
+        append_result(r, results_path)   # persist immediately, so a crash doesn't lose this seed
         results.append(r)
         print(f"  {TRAIN_COHORT} (in-sample): {r['train_cohort']}")
         print(f"  {HOLDOUT_COHORT} (test)    : {r['holdout_cohort']}")

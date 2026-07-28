@@ -11,6 +11,7 @@ probability distribution) and report both raw and corrected results.
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -26,28 +27,47 @@ from c import Autoencoder3D, train_autoencoder, encode_concat
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
-DATA_PATH      = "CUBES-Labelled-COHORTS-HISTMATCH"
+# Defaults -- overridable via --data-path / --results-path for automation
+# (e.g. running the same sweep against raw / -ZSCORE / -HISTMATCH data
+# without editing this file each time).
+DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS-HISTMATCH"
+DEFAULT_RESULTS_PATH = "c_sweep_norm_results.jsonl"
+
 TRAIN_COHORT   = "AUGSBURG"
 HOLDOUT_COHORT = "PRE-RAPID"
 
 TORCH_SEEDS    = list(range(30))   # 0..29 -- matches A/B/CNN sweep convention
 VAL_SPLIT_SEED = 40                # fixed -- same per-cohort train/val split every run
 N_EPOCHS       = 200
-RESULTS_PATH   = Path("c_sweep_norm_results.jsonl")
 
 
-def load_existing_results() -> dict[int, dict]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Option C sweep (30 seeds, with z-score correction)")
+    parser.add_argument(
+        "--data-path", default=DEFAULT_DATA_PATH,
+        help=f"Directory containing AUGSBURG/PRE-RAPID cohort data (default: {DEFAULT_DATA_PATH})",
+    )
+    parser.add_argument(
+        "--results-path", default=DEFAULT_RESULTS_PATH,
+        help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}). "
+             "Use a distinct path per data variant so results from different "
+             "preprocessing (raw/z-score/histogram-match) don't get mixed together.",
+    )
+    return parser.parse_args()
+
+
+def load_existing_results(results_path: Path) -> dict[int, dict]:
     """Load already-completed seed results, keyed by torch seed, so a rerun can skip them.
 
     NOTE: this version adds "holdout_cohort_corrected" to each result.
-    If RESULTS_PATH was written by c_sweep.py (no correction) instead of
+    If results_path was written by c_sweep.py (no correction) instead of
     this script, delete it before rerunning -- summarize() will KeyError
     on the missing field otherwise.
     """
-    if not RESULTS_PATH.exists():
+    if not results_path.exists():
         return {}
     results = {}
-    with open(RESULTS_PATH) as f:
+    with open(results_path) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -57,8 +77,8 @@ def load_existing_results() -> dict[int, dict]:
     return results
 
 
-def append_result(r: dict) -> None:
-    with open(RESULTS_PATH, "a") as f:
+def append_result(r: dict, results_path: Path) -> None:
+    with open(results_path, "a") as f:
         f.write(json.dumps(r) + "\n")
 
 
@@ -74,7 +94,7 @@ def eval_on(y: np.ndarray, y_prob: np.ndarray) -> dict:
     recall_pos = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
     recall_neg = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
     return {
-        "acc": float(acc), "bacc": float(bacc), "auc": float(auc),
+        "acc": float(acc), "balanced_acc": float(bacc), "auc": float(auc),
         "recall_pos": float(recall_pos), "recall_neg": float(recall_neg),
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
     }
@@ -130,7 +150,7 @@ def run_one_seed(torch_seed: int, aug_patients: list, pr_patients: list) -> dict
 
 def summarize(results: list, key: str, label: str) -> None:
     accs   = [r[key]["acc"] for r in results]
-    baccs  = [r[key]["bacc"] for r in results]
+    baccs  = [r[key]["balanced_acc"] for r in results]
     aucs   = [r[key]["auc"] for r in results]
     rec_p  = [r[key]["recall_pos"] for r in results]
     rec_n  = [r[key]["recall_neg"] for r in results]
@@ -148,11 +168,18 @@ def summarize(results: list, key: str, label: str) -> None:
 
 
 if __name__ == "__main__":
-    all_cohorts = load_all_cohorts(Path(DATA_PATH))
+    args = parse_args()
+    data_path = Path(args.data_path)
+    results_path = Path(args.results_path)
+
+    print(f"data path    : {data_path}")
+    print(f"results path : {results_path}")
+
+    all_cohorts = load_all_cohorts(data_path)
     aug_patients = all_cohorts[TRAIN_COHORT]
     pr_patients  = all_cohorts[HOLDOUT_COHORT]
 
-    existing = load_existing_results()
+    existing = load_existing_results(results_path)
     if existing:
         print(f"found {len(existing)} completed seed(s), will skip those: {sorted(existing.keys())}")
 
@@ -163,7 +190,7 @@ if __name__ == "__main__":
             continue
         print(f"\n{'='*60}\nTORCH SEED {torch_seed}\n{'='*60}")
         r = run_one_seed(torch_seed, aug_patients, pr_patients)
-        append_result(r)
+        append_result(r, results_path)
         results.append(r)
         print(f"  {TRAIN_COHORT} (in-sample): {r['train_cohort']}")
         print(f"  {HOLDOUT_COHORT} (test, raw)      : {r['holdout_cohort']}")
