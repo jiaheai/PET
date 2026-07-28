@@ -24,7 +24,7 @@ from cnn import (
 )
 from nifti_loader import load_all_cohorts
 
-DATA_PATH      = "CUBES-Labelled-COHORTS-HISTMATCH"
+DATA_PATH      = "CUBES-Labelled-COHORTS"
 TRAIN_COHORT   = "AUGSBURG"
 HOLDOUT_COHORT = "PRE-RAPID"
 
@@ -66,7 +66,10 @@ def append_result(r: dict) -> None:
 
 
 def run_one(torch_seed: int, aug_patients: list, pr_patients: list) -> dict:
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED)
+    train_aug, val_aug = train_test_split(
+        aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in aug_patients],
+    )
 
     torch.manual_seed(torch_seed)
     model = CNNClassifier3D(latent_dim=LATENT_DIM)

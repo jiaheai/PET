@@ -81,8 +81,15 @@ def eval_on(y: np.ndarray, y_prob: np.ndarray) -> dict:
 
 
 def run_one_seed(torch_seed: int, aug_patients: list, pr_patients: list) -> dict:
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED)
-    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=VAL_SPLIT_SEED)
+    # stratified so val doesn't accidentally end up class-skewed at n~10
+    train_aug, val_aug = train_test_split(
+        aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in aug_patients],
+    )
+    train_pr,  val_pr  = train_test_split(
+        pr_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in pr_patients],
+    )
 
     torch.manual_seed(torch_seed)
     model_aug = Autoencoder3D(latent_dim=64)

@@ -215,8 +215,15 @@ if __name__ == "__main__":
     # -- train / val split, per cohort, purely for each autoencoder's ------
     # early stopping. Both train and val patients are still "seen" by
     # harmonization (the autoencoders) -- nothing held out from them.
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=40)
-    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=0.2, random_state=40)
+    train_aug, val_aug = train_test_split(
+        aug_patients, test_size=0.2, random_state=40,
+        stratify=[p.label for p in aug_patients],
+    )
+    train_pr, val_pr = train_test_split(
+        pr_patients, test_size=0.2, random_state=40,
+        stratify=[p.label for p in pr_patients],
+    )
+
 
     print(f"AUGSBURG : {len(train_aug)} train / {len(val_aug)} val  (all {len(aug_patients)} used)")
     print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val  (all {len(pr_patients)} used)")

@@ -58,8 +58,14 @@ def run_one_seed(torch_seed: int, all_cohorts: dict) -> dict:
     aug_patients = all_cohorts[TRAIN_COHORT]     # all 50
     pr_patients  = all_cohorts[HOLDOUT_COHORT]   # all 28
 
-    train_aug, val_aug = train_test_split(aug_patients, test_size=VAL_FRACTION, random_state=VAL_SPLIT_SEED)
-    train_pr,  val_pr  = train_test_split(pr_patients,  test_size=VAL_FRACTION, random_state=VAL_SPLIT_SEED)
+    train_aug, val_aug = train_test_split(
+        aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in aug_patients],
+    )
+    train_pr,  val_pr  = train_test_split(
+        pr_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in pr_patients],
+    )
 
     torch.manual_seed(torch_seed)
     model = HarmonizationModel(latent_dim=64)

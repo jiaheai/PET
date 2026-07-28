@@ -25,7 +25,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-DATA_PATH = "CUBES-Labelled-COHORTS-ZSCORE"
+DATA_PATH = "CUBES-Labelled-COHORTS"
 TRAIN_COHORT   = "AUGSBURG"
 HOLDOUT_COHORT = "PRE-RAPID"
 
@@ -96,6 +96,13 @@ def train_cnn_baseline(
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # class-imbalance correction, matching class_weight="balanced" used by
+    # the sklearn classifiers elsewhere in this project (classifier.py, c.py).
+    # Computed from train_patients only -- never touches PRE-RAPID.
+    n_pos = sum(p.label for p in train_patients)
+    n_neg = len(train_patients) - n_pos
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+
     train_loader = DataLoader(LabeledVolumeDataset(train_patients), batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(LabeledVolumeDataset(val_patients),   batch_size=batch_size, shuffle=False)
 
@@ -112,7 +119,7 @@ def train_cnn_baseline(
             vols, labels = vols.to(device), labels.to(device)
             optimizer.zero_grad()
             logits = model(vols)
-            loss = F.binary_cross_entropy_with_logits(logits, labels)
+            loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * vols.size(0)
@@ -126,7 +133,7 @@ def train_cnn_baseline(
             for vols, labels in val_loader:
                 vols, labels = vols.to(device), labels.to(device)
                 logits = model(vols)
-                loss = F.binary_cross_entropy_with_logits(logits, labels)
+                loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
                 val_loss += loss.item() * vols.size(0)
                 n_val += vols.size(0)
         val_loss /= max(n_val, 1)
@@ -252,7 +259,10 @@ if __name__ == "__main__":
     aug_patients = all_cohorts[TRAIN_COHORT]
     pr_patients  = all_cohorts[HOLDOUT_COHORT]
 
-    train_aug, val_aug = train_test_split(aug_patients, test_size=0.2, random_state=40)
+    train_aug, val_aug = train_test_split(
+        aug_patients, test_size=0.2, random_state=40,
+        stratify=[p.label for p in aug_patients],
+    )
     print(f"AUGSBURG: {len(train_aug)} train / {len(val_aug)} val  (all {len(aug_patients)} used)")
     print(f"PRE-RAPID: held out entirely until final evaluation ({len(pr_patients)} patients)")
 
