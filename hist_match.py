@@ -77,12 +77,6 @@ def histogram_match_cohort(
     ]
 
 
-# -- saving volumes ------------------------------------------------------------
-# Same filename convention as normalize.py / save_harmonized_reconstructions,
-# so load_all_cohorts() can find and parse these files unchanged:
-#   out_root/<cohort>/{patient_id}_PET_res_{label}.nii.gz
-#   out_root/<cohort>/{patient_id}_prostate_mask_res.nii.gz
-
 def save_cohort(patients: list[PatientVolumes], out_root: str | Path) -> None:
     out_root = Path(out_root)
     for p in patients:
