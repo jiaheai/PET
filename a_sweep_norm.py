@@ -26,7 +26,7 @@ DEFAULT_RESULTS_PATH = "a_sweep_norm_results.jsonl"
 TRAIN_COHORT   = "AUGSBURG"    # entire cohort -- always the classifier's training set
 HOLDOUT_COHORT = "PRE-RAPID"   # entire cohort -- always the classifier's test set
 
-TORCH_SEEDS    = list(range(30))   # 0..29 -- init/training-stochasticity sweep
+TORCH_SEEDS    = list(range(5))   # 0..29 -- init/training-stochasticity sweep
 VAL_FRACTION   = 0.2               # per-cohort val split, used only for early stopping
 VAL_SPLIT_SEED = 40                # fixed -- keeps the same val patients across all torch seeds
 N_EPOCHS       = 1000
@@ -95,7 +95,8 @@ def run_one_seed(torch_seed: int, all_cohorts: dict) -> dict:
         train_aug=train_aug, val_aug=val_aug,
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=N_EPOCHS,
-        lambda_mmd=1,
+        lambda_mmd=0.7,
+        decoder_freeze_epoch=100,
         checkpoint_path=None,
     )
 

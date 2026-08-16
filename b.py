@@ -92,24 +92,87 @@ class HarmonizationModel(nn.Module):
     def encode_pr(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder_pr(x)
 
+    def set_decoder_trainable(self, trainable: bool) -> None:
+        """Freeze/unfreeze the shared decoder (used for stage-2 encoder-only training)."""
+        for p in self.decoder.parameters():
+            p.requires_grad = trainable
+
 
 # -- MMD loss ------------------------------------------------------------
 
-def compute_mmd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """RBF-kernel MMD in image space.
+def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
+    """RBF-kernel MMD.
 
-    Uses DOMAIN_SHIFT_GAMMA so training MMD is on the same scale as
-    the domain_shift.py evaluation metric (baseline: 0.096446).
-
-    x, y: (N, D) and (M, D) -- flattened reconstructed volumes.
+    x, y: (N, D) and (M, D) -- flattened tensors (image-space voxels or
+    latent codes, caller's choice; gamma must match the scale of whichever
+    is passed in).
     """
     def rbf(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.exp(-DOMAIN_SHIFT_GAMMA * torch.cdist(a, b).pow(2))
+        return torch.exp(-gamma * torch.cdist(a, b).pow(2))
 
     kxx = rbf(x, x).mean()
     kyy = rbf(y, y).mean()
     kxy = rbf(x, y).mean()
     return kxx + kyy - 2 * kxy
+
+
+def median_heuristic_gamma(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+    """Median-heuristic RBF bandwidth: gamma = 1 / (2 * median(pairwise sq dist)).
+
+    DOMAIN_SHIFT_GAMMA is a fixed constant tuned for image-space voxel scale
+    (to match domain_shift.py). Latent codes have no such fixed, known scale
+    -- they're raw nn.Linear output, unbounded and free to drift during
+    training -- so a fixed gamma there would either be ~0 (kernel saturates
+    to 1 for every pair, no signal) or huge (kernel collapses to 0 for every
+    pair, no signal) depending on what the encoders happen to learn. The
+    median heuristic instead reads the bandwidth off the actual batch each
+    step, adapting as the latent scale shifts during training.
+
+    Computed under no_grad -- this only chooses a bandwidth constant, it
+    isn't meant to be differentiated through.
+    """
+    pooled = torch.cat([x, y], dim=0)
+    with torch.no_grad():
+        d2 = torch.cdist(pooled, pooled).pow(2)
+        n = d2.size(0)
+        off_diag = d2[~torch.eye(n, dtype=torch.bool, device=d2.device)]
+        if off_diag.numel() == 0:
+            return 1.0
+        med = off_diag.median().clamp_min(eps)
+        gamma = 1.0 / (2.0 * med)
+    return gamma.item()
+
+
+def compute_mmd_stratified(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    labels_x: torch.Tensor,
+    labels_y: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Label-stratified MMD: averages MMD within each shared label instead of
+    matching the pooled batch distribution. Prevents the model from closing
+    the aug/pr gap by blurring label-specific features when the two cohorts
+    have different label mixes.
+
+    gamma is computed once from the full (unstratified) batch by the caller
+    and reused across all label subsets here -- estimating it separately per
+    label would be noisy with only a handful of samples per label per batch.
+
+    Falls back to 0.0 (not the pooled MMD) if no label has >=2 samples on
+    both sides in this batch.
+    """
+    shared_labels = set(labels_x.tolist()) & set(labels_y.tolist())
+    per_label = []
+    for lbl in shared_labels:
+        xi = x[labels_x == lbl]
+        yi = y[labels_y == lbl]
+        if xi.size(0) < 2 or yi.size(0) < 2:
+            continue
+        per_label.append(compute_mmd(xi, yi, gamma))
+    if not per_label:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+    return torch.stack(per_label).mean()
 
 
 # -- dataset ------------------------------------------------------------
@@ -121,9 +184,11 @@ class VolumeDataset(Dataset):
     def __len__(self) -> int:
         return len(self.patients)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        vol = self.patients[idx].pet_masked.astype("float32")
-        return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        patient = self.patients[idx]
+        vol = patient.pet_masked.astype("float32")
+        label = torch.tensor(int(patient.label), dtype=torch.long)
+        return torch.from_numpy(vol).unsqueeze(0), label   # (1, 32, 32, 32), scalar
 
 
 # -- training loop ------------------------------------------------------------
@@ -138,15 +203,33 @@ def train_harmonization(
     batch_size:    int   = 8,
     lr:            float = 1e-3,
     lambda_mmd:    float = 1.0,
+    decoder_freeze_epoch: int | None = None,
     device:        str   = "cuda" if torch.cuda.is_available() else "cpu",
     patience:      int   = 200,
     checkpoint_path: str | None = "best_harmonization.pt",
 ) -> HarmonizationModel:
+    """
+    decoder_freeze_epoch : if set, splits training into two stages:
+                         stage 1 (epoch < decoder_freeze_epoch) trains the
+                         full model (encoders + decoder) with the mmd term
+                         excluded from the loss entirely (lambda_mmd_t=0),
+                         i.e. pure reconstruction. At decoder_freeze_epoch
+                         the decoder is frozen and mmd turns on at its full
+                         lambda_mmd weight; from then on only encoder_aug
+                         and encoder_pr can respond to it, since the
+                         decoder they render through is locked in as
+                         whatever it learned to do well in stage 1.
+                         None disables this and trains with mmd on at
+                         lambda_mmd the whole run, as before.
+    """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    decoder_frozen = False
 
     print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}")
     print(f"baseline MMD : 0.096446")
+    if decoder_freeze_epoch is not None:
+        print(f"decoder freeze at epoch {decoder_freeze_epoch} (stage-2 encoder-only training)")
 
     train_aug_loader = DataLoader(VolumeDataset(train_aug), batch_size=batch_size, shuffle=True)
     train_pr_loader  = DataLoader(VolumeDataset(train_pr),  batch_size=batch_size, shuffle=True)
@@ -159,10 +242,41 @@ def train_harmonization(
     epochs_since_improvement = 0
 
     for epoch in range(n_epochs):
+        # -- stage-2 switch: freeze decoder, rebuild optimizer over remaining params --
+        if decoder_freeze_epoch is not None and epoch == decoder_freeze_epoch and not decoder_frozen:
+            model.set_decoder_trainable(False)
+            decoder_frozen = True
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
+            # val_loss's scale jumps here (mmd term switches on): reset both
+            # the patience counter AND best_val_loss, not just the counter.
+            # Otherwise every stage-2 val_loss (which now includes a
+            # non-negative mmd term) is compared against stage-1's best
+            # (pure recon, no mmd added) and can essentially never win --
+            # the final checkpoint would silently stay pinned to a
+            # pre-freeze, pre-harmonization snapshot no matter how long
+            # stage 2 runs.
+            epochs_since_improvement = 0
+            best_val_loss = float("inf")
+            print(f"epoch {epoch:3d}  -- decoder frozen, mmd turned on (lambda_mmd={lambda_mmd}), optimizing encoders only from here on")
+
+        # Stage 1 (epoch < decoder_freeze_epoch): pure reconstruction, mmd
+        # term excluded from the loss entirely -- not just small, exactly 0,
+        # so the encoders/decoder first learn to reconstruct each cohort
+        # well on their own before any distribution-matching pressure.
+        # Stage 2 (epoch >= decoder_freeze_epoch, decoder frozen): mmd turns
+        # on at its full target weight and only the encoders can respond to it.
+        # If decoder_freeze_epoch is None, mmd is on at lambda_mmd the whole run.
+        if decoder_freeze_epoch is not None and epoch < decoder_freeze_epoch:
+            lambda_mmd_t = 0.0
+        else:
+            lambda_mmd_t = lambda_mmd
+
         # -- training --------------------------------------------------
         model.train()
-        train_recon     = 0.0
-        train_mmd       = 0.0
+        train_recon       = 0.0
+        train_mmd_latent  = 0.0   # drives the loss
+        train_mmd_image   = 0.0   # logged only, for domain_shift.py comparability
         n_train         = 0
         n_train_batches = 0
 
@@ -171,37 +285,57 @@ def train_harmonization(
         else:
             train_iter = zip(itertools.cycle(train_aug_loader), train_pr_loader)
 
-        for batch_aug, batch_pr in train_iter:
+        for (batch_aug, label_aug), (batch_pr, label_pr) in train_iter:
             batch_aug = batch_aug.to(device)
             batch_pr  = batch_pr.to(device)
+            label_aug = label_aug.to(device)
+            label_pr  = label_pr.to(device)
 
             optimizer.zero_grad()
             x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
 
             recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
-            mmd   = compute_mmd(
-                x_hat_aug.flatten(start_dim=1),
-                x_hat_pr.flatten(start_dim=1),
+
+            # Latent-space MMD drives the loss: aligns the encoders' codes
+            # instead of asking two different patients' reconstructed pixels
+            # to match. gamma is read off this batch's own latent scale
+            # (median heuristic) since encoder output isn't a fixed,
+            # pre-known scale the way image intensities are.
+            latent_gamma = median_heuristic_gamma(z_aug, z_pr)
+            mmd_latent = compute_mmd_stratified(
+                z_aug, z_pr, label_aug, label_pr, gamma=latent_gamma,
             )
-            loss  = recon + lambda_mmd * mmd
+            loss = recon + lambda_mmd_t * mmd_latent
 
             loss.backward()
             optimizer.step()
 
+            # Image-space MMD: logged only (not in loss), kept purely so the
+            # printed number stays comparable to domain_shift.py's metric.
+            with torch.no_grad():
+                mmd_image = compute_mmd_stratified(
+                    x_hat_aug.flatten(start_dim=1),
+                    x_hat_pr.flatten(start_dim=1),
+                    label_aug, label_pr, gamma=DOMAIN_SHIFT_GAMMA,
+                )
+
             n = batch_aug.size(0) + batch_pr.size(0)
-            train_recon += recon.item() * n
-            train_mmd   += mmd.item()
+            train_recon      += recon.item() * n
+            train_mmd_latent += mmd_latent.item()
+            train_mmd_image  += mmd_image.item()
             n_train     += n
             n_train_batches += 1
 
-        train_recon /= max(n_train, 1)
-        train_mmd   /= max(n_train_batches, 1)
-        train_loss   = train_recon + lambda_mmd * train_mmd
+        train_recon      /= max(n_train, 1)
+        train_mmd_latent /= max(n_train_batches, 1)
+        train_mmd_image  /= max(n_train_batches, 1)
+        train_loss = train_recon + lambda_mmd_t * train_mmd_latent
 
         # -- validation --------------------------------------------------
         model.eval()
-        val_recon     = 0.0
-        val_mmd       = 0.0
+        val_recon      = 0.0
+        val_mmd_latent = 0.0
+        val_mmd_image  = 0.0
         n_val         = 0
         n_val_batches = 0
 
@@ -211,32 +345,44 @@ def train_harmonization(
             val_iter = zip(itertools.cycle(val_aug_loader), val_pr_loader)
 
         with torch.no_grad():
-            for batch_aug, batch_pr in val_iter:
+            for (batch_aug, label_aug), (batch_pr, label_pr) in val_iter:
                 batch_aug = batch_aug.to(device)
                 batch_pr  = batch_pr.to(device)
+                label_aug = label_aug.to(device)
+                label_pr  = label_pr.to(device)
+
                 x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
 
                 recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
-                mmd   = compute_mmd(
+                latent_gamma = median_heuristic_gamma(z_aug, z_pr)
+                mmd_latent = compute_mmd_stratified(
+                    z_aug, z_pr, label_aug, label_pr, gamma=latent_gamma,
+                )
+                mmd_image = compute_mmd_stratified(
                     x_hat_aug.flatten(start_dim=1),
                     x_hat_pr.flatten(start_dim=1),
+                    label_aug, label_pr, gamma=DOMAIN_SHIFT_GAMMA,
                 )
 
                 n = batch_aug.size(0) + batch_pr.size(0)
-                val_recon += recon.item() * n
-                val_mmd   += mmd.item()
+                val_recon      += recon.item() * n
+                val_mmd_latent += mmd_latent.item()
+                val_mmd_image  += mmd_image.item()
                 n_val     += n
                 n_val_batches += 1
 
-        val_recon /= max(n_val, 1)
-        val_mmd   /= max(n_val_batches, 1)
-        val_loss   = val_recon + lambda_mmd * val_mmd
+        val_recon      /= max(n_val, 1)
+        val_mmd_latent /= max(n_val_batches, 1)
+        val_mmd_image  /= max(n_val_batches, 1)
+        val_loss = val_recon + lambda_mmd_t * val_mmd_latent
 
         if epoch % 10 == 0 or epoch == n_epochs - 1:
             print(
-                f"epoch {epoch:3d}  "
-                f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  mmd {train_mmd:.6f})  "
-                f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  mmd {val_mmd:.6f})"
+                f"epoch {epoch:3d}  lambda_mmd {lambda_mmd_t:.4f}  "
+                f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  "
+                f"mmd_z {train_mmd_latent:.6f}  mmd_img {train_mmd_image:.6f})  "
+                f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  "
+                f"mmd_z {val_mmd_latent:.6f}  mmd_img {val_mmd_image:.6f})"
             )
 
         if val_loss < best_val_loss:
@@ -348,6 +494,7 @@ if __name__ == "__main__":
         train_pr=train_pr,   val_pr=val_pr,
         n_epochs=1000,
         lambda_mmd=1,
+        decoder_freeze_epoch=100,    # fix #3: freeze decoder early, encoder-only after
         checkpoint_path=str(models_dir / "best_harmonization.pt"),
     )
     
