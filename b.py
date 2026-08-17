@@ -143,36 +143,13 @@ def median_heuristic_gamma(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) 
     return gamma.item()
 
 
-def compute_mmd_stratified(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    labels_x: torch.Tensor,
-    labels_y: torch.Tensor,
-    gamma: float,
-) -> torch.Tensor:
-    """Label-stratified MMD: averages MMD within each shared label instead of
-    matching the pooled batch distribution. Prevents the model from closing
-    the aug/pr gap by blurring label-specific features when the two cohorts
-    have different label mixes.
-
-    gamma is computed once from the full (unstratified) batch by the caller
-    and reused across all label subsets here -- estimating it separately per
-    label would be noisy with only a handful of samples per label per batch.
-
-    Falls back to 0.0 (not the pooled MMD) if no label has >=2 samples on
-    both sides in this batch.
-    """
-    shared_labels = set(labels_x.tolist()) & set(labels_y.tolist())
-    per_label = []
-    for lbl in shared_labels:
-        xi = x[labels_x == lbl]
-        yi = y[labels_y == lbl]
-        if xi.size(0) < 2 or yi.size(0) < 2:
-            continue
-        per_label.append(compute_mmd(xi, yi, gamma))
-    if not per_label:
-        return torch.zeros((), device=x.device, dtype=x.dtype)
-    return torch.stack(per_label).mean()
+def compute_mmd_stratified(*args, **kwargs):
+    raise NotImplementedError(
+        "compute_mmd_stratified was removed: it required target-cohort labels "
+        "(e.g. PRE-RAPID's), which aren't available at deployment time for a "
+        "real unlabeled target cohort. Use compute_mmd(x, y, gamma) instead -- "
+        "pooled, no labels needed."
+    )
 
 
 # -- dataset ------------------------------------------------------------
@@ -184,11 +161,9 @@ class VolumeDataset(Dataset):
     def __len__(self) -> int:
         return len(self.patients)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        patient = self.patients[idx]
-        vol = patient.pet_masked.astype("float32")
-        label = torch.tensor(int(patient.label), dtype=torch.long)
-        return torch.from_numpy(vol).unsqueeze(0), label   # (1, 32, 32, 32), scalar
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        vol = self.patients[idx].pet_masked.astype("float32")
+        return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
 
 
 # -- training loop ------------------------------------------------------------
@@ -285,11 +260,9 @@ def train_harmonization(
         else:
             train_iter = zip(itertools.cycle(train_aug_loader), train_pr_loader)
 
-        for (batch_aug, label_aug), (batch_pr, label_pr) in train_iter:
+        for batch_aug, batch_pr in train_iter:
             batch_aug = batch_aug.to(device)
             batch_pr  = batch_pr.to(device)
-            label_aug = label_aug.to(device)
-            label_pr  = label_pr.to(device)
 
             optimizer.zero_grad()
             x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
@@ -298,13 +271,15 @@ def train_harmonization(
 
             # Latent-space MMD drives the loss: aligns the encoders' codes
             # instead of asking two different patients' reconstructed pixels
-            # to match. gamma is read off this batch's own latent scale
-            # (median heuristic) since encoder output isn't a fixed,
-            # pre-known scale the way image intensities are.
+            # to match. Pooled over the whole batch -- NOT label-stratified,
+            # since the target cohort (PRE-RAPID here, but in general
+            # whatever cohort you're deploying against) won't have real
+            # labels available at deployment time. gamma is read off this
+            # batch's own latent scale (median heuristic) since encoder
+            # output isn't a fixed, pre-known scale the way image
+            # intensities are.
             latent_gamma = median_heuristic_gamma(z_aug, z_pr)
-            mmd_latent = compute_mmd_stratified(
-                z_aug, z_pr, label_aug, label_pr, gamma=latent_gamma,
-            )
+            mmd_latent = compute_mmd(z_aug, z_pr, gamma=latent_gamma)
             loss = recon + lambda_mmd_t * mmd_latent
 
             loss.backward()
@@ -312,11 +287,13 @@ def train_harmonization(
 
             # Image-space MMD: logged only (not in loss), kept purely so the
             # printed number stays comparable to domain_shift.py's metric.
+            # Also pooled, not stratified, for the same label-availability
+            # reason as mmd_latent above.
             with torch.no_grad():
-                mmd_image = compute_mmd_stratified(
+                mmd_image = compute_mmd(
                     x_hat_aug.flatten(start_dim=1),
                     x_hat_pr.flatten(start_dim=1),
-                    label_aug, label_pr, gamma=DOMAIN_SHIFT_GAMMA,
+                    gamma=DOMAIN_SHIFT_GAMMA,
                 )
 
             n = batch_aug.size(0) + batch_pr.size(0)
@@ -345,23 +322,19 @@ def train_harmonization(
             val_iter = zip(itertools.cycle(val_aug_loader), val_pr_loader)
 
         with torch.no_grad():
-            for (batch_aug, label_aug), (batch_pr, label_pr) in val_iter:
+            for batch_aug, batch_pr in val_iter:
                 batch_aug = batch_aug.to(device)
                 batch_pr  = batch_pr.to(device)
-                label_aug = label_aug.to(device)
-                label_pr  = label_pr.to(device)
 
                 x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
 
                 recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
                 latent_gamma = median_heuristic_gamma(z_aug, z_pr)
-                mmd_latent = compute_mmd_stratified(
-                    z_aug, z_pr, label_aug, label_pr, gamma=latent_gamma,
-                )
-                mmd_image = compute_mmd_stratified(
+                mmd_latent = compute_mmd(z_aug, z_pr, gamma=latent_gamma)
+                mmd_image = compute_mmd(
                     x_hat_aug.flatten(start_dim=1),
                     x_hat_pr.flatten(start_dim=1),
-                    label_aug, label_pr, gamma=DOMAIN_SHIFT_GAMMA,
+                    gamma=DOMAIN_SHIFT_GAMMA,
                 )
 
                 n = batch_aug.size(0) + batch_pr.size(0)
