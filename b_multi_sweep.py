@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from b_3 import HarmonizationModel, train_harmonization_multi
+from b_3_multi import HarmonizationModel, train_harmonization_multi
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
@@ -21,10 +21,10 @@ DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "b_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]   # replace COHORT_C with your actual 3rd cohort name
-TORCH_SEEDS    = list(range(1))
+TORCH_SEEDS    = list(range(5))
 VAL_SPLIT_SEED = 40             # fixed -- keeps the same val patients across all torch seeds
 N_EPOCHS       = 1000
-LAMBDA_MMD     = 1
+LAMBDA_MMD     = 1000
 DECODER_FREEZE_EPOCH = 100
 
 
@@ -43,34 +43,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _result_key(target_cohort: str, torch_seed: int) -> str:
-    """Composite key so results are resumable per (target_cohort, seed) pair,
-    not just per seed -- with N target choices x M seeds, a plain seed key
-    would collide across different target cohorts."""
-    return f"{target_cohort}::{torch_seed}"
-
-
-def load_existing_results(results_path: Path) -> dict[str, dict]:
-    """Load already-completed (target_cohort, seed) combinations, so a rerun
-    can skip them.
-
-    NOTE: if results_path was written by a differently-shaped version of
-    this script, delete it before rerunning -- summarize() will KeyError on
-    a missing field otherwise.
-    """
-    if not results_path.exists():
-        return {}
-    results = {}
-    with open(results_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            results[_result_key(r["target_cohort"], r["torch_seed"])] = r
-    return results
-
-
 def append_result(r: dict, results_path: Path) -> None:
     with open(results_path, "a") as f:
         f.write(json.dumps(r) + "\n")
@@ -81,10 +53,10 @@ def encode_patients(
     patients: list,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Encode patients into latent vectors using the single shared encoder.
-    Unlike the 2-encoder version's classifier.py, there's no per-cohort
-    encoder to look up -- harmonization_multi's HarmonizationModel has one
-    encoder for every cohort, so this is simpler than the aug/pr dispatch.
+    """Encode patients into latent vectors using each patient's OWN cohort's
+    encoder (model.encoders[patient.cohort]) -- mirrors classifier.py's
+    _ENCODE_FN_BY_COHORT dispatch for the 2-encoder version, generalized to
+    N cohorts via a ModuleDict instead of a fixed aug/pr attribute lookup.
     """
     model = model.to(device)
     model.eval()
@@ -96,7 +68,7 @@ def encode_patients(
                 .unsqueeze(0).unsqueeze(0)
                 .to(device)
             )
-            z = model.encode(vol).squeeze(0).cpu().numpy()
+            z = model.encode(patient.cohort, vol).squeeze(0).cpu().numpy()
             zs.append(z)
             ys.append(patient.label)
     return np.stack(zs), np.array(ys)
@@ -122,15 +94,15 @@ def eval_set(model, clf, plist, prob_override=None) -> dict | None:
     }
 
 
-def run_one_combination(torch_seed: int, target_cohort: str, all_cohorts: dict) -> dict:
-    """One (target_cohort, torch_seed) run: harmonize with target_cohort held
-    label-blind (per harmonization_multi's target_cohort routing -- pairs
-    touching it are pooled, pairs among the other cohorts are stratified),
-    then fit the classifier on the POOLED known cohorts and evaluate on the
-    target cohort.
+def train_model_once(torch_seed: int, all_cohorts: dict) -> tuple[HarmonizationModel, dict]:
+    """Train the harmonization model ONCE for this seed. Harmonization no
+    longer depends on target_cohort at all -- MMD is fully pooled and
+    label-blind regardless of which cohort you're about to evaluate
+    against -- so training a fresh model per target_cohort combination
+    would just be identical work repeated N times for nothing. Returns the
+    trained model plus cohort_all (all patients per cohort, unsplit) for
+    the evaluation step.
     """
-    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
-
     cohort_train, cohort_val, cohort_all = {}, {}, {}
     for name in COHORT_NAMES:
         patients = all_cohorts[name]
@@ -143,16 +115,25 @@ def run_one_combination(torch_seed: int, target_cohort: str, all_cohorts: dict) 
         cohort_val[name] = val_p
 
     torch.manual_seed(torch_seed)
-    model = HarmonizationModel(latent_dim=64)
+    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
     model = train_harmonization_multi(
         model,
         cohort_train=cohort_train, cohort_val=cohort_val,
         n_epochs=N_EPOCHS,
         lambda_mmd=LAMBDA_MMD,
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
-        target_cohort=target_cohort,
         checkpoint_path=None,
     )
+    return model, cohort_all
+
+
+def evaluate_target(torch_seed: int, model: HarmonizationModel, cohort_all: dict, target_cohort: str) -> dict:
+    """Fit the classifier on the known (non-target) cohorts' LABELS and
+    evaluate on target_cohort -- reuses an already-trained model, doesn't
+    retrain anything. This is the part that actually varies per
+    (target_cohort, torch_seed) combination now.
+    """
+    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
 
     # classifier: fit on ALL patients from the known (non-target) cohorts,
     # pooled together -- this is the multi-cohort analogue of "fit on all
@@ -165,19 +146,28 @@ def run_one_combination(torch_seed: int, target_cohort: str, all_cohorts: dict) 
     target_patients = cohort_all[target_cohort]
 
     # -- z-score correction: align target cohort's predicted-probability ---
-    # distribution to the pooled known cohorts' (unlabeled statistics only,
-    # no target-cohort labels used in computing the correction itself --
-    # same principle as the 2-cohort script's use of zscore_shift_correct).
-    Z_known_full, _ = encode_patients(model, known_patients)
+    # distribution to a SINGLE reference cohort's, not the pooled known
+    # cohorts. Pooling known_patients together only makes sense as a
+    # calibration reference if the known cohorts share one distribution --
+    # exactly the thing we can't assume, since domain shift between them is
+    # possible too. Use whichever known cohort has the most patients this
+    # rotation as the reference (larger cohort -> more stable mean/std
+    # estimate for the correction) -- never the target's own labels, same
+    # principle as the 2-cohort script's use of zscore_shift_correct.
+    reference_cohort = max(known_cohorts, key=lambda c: len(cohort_all[c]))
+    reference_patients = cohort_all[reference_cohort]
+
+    Z_reference_full, _ = encode_patients(model, reference_patients)
     Z_target_full, _ = encode_patients(model, target_patients)
-    prob_known = clf.predict_proba(Z_known_full)[:, 1]
+    prob_reference = clf.predict_proba(Z_reference_full)[:, 1]
     prob_target = clf.predict_proba(Z_target_full)[:, 1]
-    prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
+    prob_target_corrected = zscore_shift_correct(prob_source=prob_reference, prob_target=prob_target)
 
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
         "known_cohorts": known_cohorts,
+        "calibration_reference_cohort": reference_cohort,
         "known_cohort_insample": eval_set(model, clf, known_patients),                                  # in-sample, reference only
         "target_cohort_raw": eval_set(model, clf, target_patients),                                      # raw -- the headline cross-cohort result
         "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),  # z-score corrected
@@ -218,21 +208,18 @@ if __name__ == "__main__":
         if name not in all_cohorts:
             raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
 
-    existing = load_existing_results(results_path)
-    if existing:
-        print(f"found {len(existing)} completed combination(s) in {results_path}, will skip those: "
-              f"{sorted(existing.keys())}")
+    # Always run fresh -- no resume/skip logic. Truncate results_path up
+    # front so this run's results aren't mixed with any prior run's.
+    results_path.write_text("")
 
     results = []
-    for target_cohort in COHORT_NAMES:
-        for torch_seed in TORCH_SEEDS:
-            key = _result_key(target_cohort, torch_seed)
-            if key in existing:
-                results.append(existing[key])
-                continue
+    for torch_seed in TORCH_SEEDS:
+        print(f"\n{'='*60}\nTORCH SEED {torch_seed}  (training once, evaluating against: {COHORT_NAMES})\n{'='*60}")
+        model, cohort_all = train_model_once(torch_seed, all_cohorts)
 
-            print(f"\n{'='*60}\nTARGET COHORT {target_cohort}  --  TORCH SEED {torch_seed}\n{'='*60}")
-            r = run_one_combination(torch_seed, target_cohort, all_cohorts)
+        for target_cohort in COHORT_NAMES:
+            print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} ---")
+            r = evaluate_target(torch_seed, model, cohort_all, target_cohort)
             append_result(r, results_path)   # persist immediately, so a crash doesn't lose this run
             results.append(r)
             print(f"  known cohorts (in-sample) : {r['known_cohort_insample']}")
