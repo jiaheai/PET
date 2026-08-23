@@ -20,10 +20,13 @@ from cnn import zscore_shift_correct   # reuse the same correction used for the 
 DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "b_sweep_anchor_results.jsonl"   # separate from the pairwise sweep's results --
                                                           # same JSON schema, different training method,
-                                                          # don't want them silently pooled in summarize()
+                                                          # don't want them silently pooled in summarize().
+                                                          # Contains both record_type="run" (per-seed,
+                                                          # per-target-cohort) and record_type="summary"
+                                                          # (aggregate, appended at the end) lines.
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-ANCHOR_COHORT  = "SWISS"   # fixed reference cohort every run -- your largest/most-trusted cohort;
+ANCHOR_COHORT  = "AUGSBURG"   # fixed reference cohort every run -- your largest/most-trusted cohort;
                                 # stays the same across all target_cohort rotations below. If a given
                                 # combination has target_cohort == ANCHOR_COHORT, anchor_mmd degrades to
                                 # fully pooled for that run (verified safe, but loses the anchor benefit
@@ -51,8 +54,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def append_result(r: dict, results_path: Path) -> None:
+    r = {"record_type": "run", **r}
     with open(results_path, "a") as f:
         f.write(json.dumps(r) + "\n")
+
+
+def append_summary(s: dict, results_path: Path) -> None:
+    s = {"record_type": "summary", **s}
+    with open(results_path, "a") as f:
+        f.write(json.dumps(s) + "\n")
 
 
 def encode_patients(
@@ -155,35 +165,41 @@ def evaluate_target(torch_seed: int, model: HarmonizationModel, cohort_all: dict
     target_patients = cohort_all[target_cohort]
 
     # -- z-score correction: align target cohort's predicted-probability ---
-    # distribution to a SINGLE reference cohort's, not the pooled known
-    # cohorts. Pooling known_patients together only makes sense as a
-    # calibration reference if the known cohorts share one distribution --
-    # exactly the thing we can't assume, since domain shift between them is
-    # possible too. Use whichever known cohort has the most patients this
-    # rotation as the reference (larger cohort -> more stable mean/std
-    # estimate for the correction) -- never the target's own labels, same
-    # principle as the 2-cohort script's use of zscore_shift_correct.
-    reference_cohort = max(known_cohorts, key=lambda c: len(cohort_all[c]))
-    reference_patients = cohort_all[reference_cohort]
-
-    Z_reference_full, _ = encode_patients(model, reference_patients)
+    # distribution to the POOLED known cohorts' -- i.e. exactly the same
+    # data clf was just fit on (known_patients, above). The classifier's
+    # 0.5 threshold is calibrated against that pooled distribution by
+    # construction (that's what .fit() saw), so that's the correct
+    # reference to measure target's shift against -- not a single cohort.
+    # (A single-cohort reference was tried here previously, reasoning that
+    # pooling two possibly-shifted cohorts gives a statistically murky
+    # blended reference. True in the abstract, but beside the point: the
+    # correction's job is to match what the classifier actually expects,
+    # and that's defined by its training distribution, murky or not --
+    # using a single cohort just measures target against the wrong
+    # baseline instead. Never uses target's own labels either way, same
+    # principle as the 2-cohort script's use of zscore_shift_correct.)
+    Z_known_full, _ = encode_patients(model, known_patients)
     Z_target_full, _ = encode_patients(model, target_patients)
-    prob_reference = clf.predict_proba(Z_reference_full)[:, 1]
+    prob_known = clf.predict_proba(Z_known_full)[:, 1]
     prob_target = clf.predict_proba(Z_target_full)[:, 1]
-    prob_target_corrected = zscore_shift_correct(prob_source=prob_reference, prob_target=prob_target)
+    prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
 
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
         "known_cohorts": known_cohorts,
-        "calibration_reference_cohort": reference_cohort,
         "known_cohort_insample": eval_set(model, clf, known_patients),                                  # in-sample, reference only
         "target_cohort_raw": eval_set(model, clf, target_patients),                                      # raw -- the headline cross-cohort result
         "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),  # z-score corrected
     }
 
 
-def summarize(results: list, key: str, label: str) -> None:
+def summarize(results: list, key: str, label: str) -> dict:
+    """Print the aggregate stats for `key` across `results` (unchanged
+    behavior) AND return them as a dict so callers can persist them --
+    previously this function only printed, so these numbers existed
+    nowhere but stdout.
+    """
     accs          = [r[key]["acc"] for r in results if r[key] is not None]
     aucs          = [r[key]["auc"] for r in results if r[key] is not None]
     recalls_pos   = [r[key]["recall_pos"] for r in results if r[key] is not None]
@@ -201,6 +217,22 @@ def summarize(results: list, key: str, label: str) -> None:
     print(f"per-run rec+   : {[round(r, 3) for r in recalls_pos]}")
     print(f"per-run rec-   : {[round(r, 3) for r in recalls_neg]}")
     print(f"per-run bacc   : {[round(b, 3) for b in balanced_accs]}")
+
+    return {
+        "label": label,
+        "key": key,
+        "n_runs": len(accs),
+        "acc_mean": float(np.nanmean(accs)), "acc_std": float(np.nanstd(accs)),
+        "auc_mean": float(np.nanmean(aucs)), "auc_std": float(np.nanstd(aucs)),
+        "recall_pos_mean": float(np.nanmean(recalls_pos)), "recall_pos_std": float(np.nanstd(recalls_pos)),
+        "recall_neg_mean": float(np.nanmean(recalls_neg)), "recall_neg_std": float(np.nanstd(recalls_neg)),
+        "balanced_acc_mean": float(np.nanmean(balanced_accs)), "balanced_acc_std": float(np.nanstd(balanced_accs)),
+        "per_run_acc": [round(a, 3) for a in accs],
+        "per_run_auc": [round(a, 3) for a in aucs],
+        "per_run_recall_pos": [round(r, 3) for r in recalls_pos],
+        "per_run_recall_neg": [round(r, 3) for r in recalls_neg],
+        "per_run_balanced_acc": [round(b, 3) for b in balanced_accs],
+    }
 
 
 if __name__ == "__main__":
@@ -235,16 +267,24 @@ if __name__ == "__main__":
             print(f"  {target_cohort} (target)  : {r['target_cohort_raw']}")
 
     # -- per-target-cohort summaries -----------------------------------------
+    summary_stats = []
     for target_cohort in COHORT_NAMES:
         subset = [r for r in results if r["target_cohort"] == target_cohort]
         if not subset:
             continue
-        summarize(subset, "target_cohort_raw", f"target={target_cohort} (raw, held-out)")
-        summarize(subset, "target_cohort_corrected", f"target={target_cohort} (z-score corrected)")
+        summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (raw, held-out)"))
+        summary_stats.append(summarize(subset, "target_cohort_corrected", f"target={target_cohort} (z-score corrected)"))
 
     # -- overall summary across every target-cohort choice -------------------
     # This is the number that actually answers the feasibility question:
     # does harmonization generalize regardless of *which* cohort gets left
     # out, not just for one arbitrarily chosen train/test split.
-    summarize(results, "target_cohort_raw", "ALL target cohorts pooled (raw, held-out)")
-    summarize(results, "target_cohort_corrected", "ALL target cohorts pooled (z-score corrected)")
+    summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (raw, held-out)"))
+    summary_stats.append(summarize(results, "target_cohort_corrected", "ALL target cohorts pooled (z-score corrected)"))
+
+    # Appended to the SAME results_path as the per-run records, at the end
+    # of the file, each tagged record_type="summary" so a reader can tell
+    # them apart from record_type="run" lines without guessing from shape.
+    for s in summary_stats:
+        append_summary(s, results_path)
+    print(f"\nsummary appended to: {results_path}")
