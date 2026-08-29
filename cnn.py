@@ -216,8 +216,16 @@ def zscore_shift_correct(prob_source: np.ndarray, prob_target: np.ndarray) -> np
                  match (typically the training cohort, e.g. AUGSBURG).
     prob_target: probabilities from the cohort being corrected
                  (typically the held-out cohort, e.g. PRE-RAPID).
+
+    If prob_target has zero variance (the classifier assigned every
+    patient in that group the same probability), z-scoring is undefined
+    (0/0) -- there's no shift/scale to correct in a distribution with no
+    spread. In that case, return prob_target unchanged rather than NaN.
     """
-    z = (prob_target - prob_target.mean()) / prob_target.std()
+    target_std = prob_target.std()
+    if target_std == 0 or not np.isfinite(target_std):
+        return prob_target.copy()
+    z = (prob_target - prob_target.mean()) / target_std
     return z * prob_source.std() + prob_source.mean()
 
 

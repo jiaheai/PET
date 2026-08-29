@@ -23,11 +23,19 @@ DEFAULT_RESULTS_PATH = "b_sweep_multi_results.jsonl"   # contains both record_ty
                                                          # (aggregate, appended at the end) lines.
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(5))
+TORCH_SEEDS    = list(range(25))
 VAL_SPLIT_SEED = 40             # fixed -- keeps the same val patients across all torch seeds
+TARGET_HOLDOUT_SEED = 123       # fixed -- keeps the same held-out half of the target cohort across
+                                 # all torch seeds, so only the harmonization training itself varies
+                                 # with torch_seed, not which patients were held out
 N_EPOCHS       = 1000
-LAMBDA_MMD     = 1000
-DECODER_FREEZE_EPOCH = 100
+LAMBDA_MMD     = 100
+LATENT_GAMMA_MODE = "adaptive"   # "adaptive" (recompute every batch) or "fixed" (frozen
+                                  # once at decoder_freeze_epoch, then held constant) --
+                                  # see train_harmonization_multi's docstring for what this
+                                  # isolates. Change this and rerun to compare.
+DECODER_FREEZE_EPOCH = 50
+PATIENCE = 100
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +50,13 @@ def parse_args() -> argparse.Namespace:
         "--results-path", default=DEFAULT_RESULTS_PATH,
         help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}).",
     )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Wipe --results-path and rerun every seed in TORCH_SEEDS from scratch, "
+             "ignoring anything already there. Default: resume -- reuse any torch_seed "
+             "that already has a complete run (all cohorts as target) in --results-path, "
+             "and only run the seeds still missing.",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +70,57 @@ def append_summary(s: dict, results_path: Path) -> None:
     s = {"record_type": "summary", **s}
     with open(results_path, "a") as f:
         f.write(json.dumps(s) + "\n")
+
+
+def load_existing_results(results_path: Path) -> list[dict]:
+    """Load previously written 'run' records from results_path, if any.
+    'summary' records are dropped unconditionally -- the summary is always
+    regenerated fresh from the full (resumed + new) result set at the end
+    of this run, never carried over from a prior run's aggregation.
+    """
+    if not results_path.exists():
+        return []
+    runs = []
+    with open(results_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.pop("record_type", None) == "run":
+                runs.append(rec)   # record_type popped -- shape now matches evaluate_target()'s return
+    return runs
+
+
+def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
+    """A torch_seed counts as complete only if it has a run record for
+    EVERY cohort as target. A seed interrupted partway through its cohort
+    rotation is NOT complete -- its partial rows get discarded and the
+    whole seed is redone from scratch below, rather than silently
+    averaging in an incomplete seed. Also means a COHORT_NAMES change
+    (e.g. a cohort added) correctly invalidates old seeds that only
+    covered the previous, smaller cohort set.
+    """
+    by_seed: dict[int, set[str]] = {}
+    for r in runs:
+        by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
+    return {seed for seed, cohorts in by_seed.items() if cohorts == set(cohort_names)}
+
+
+def split_target_cohort(patients: list) -> tuple[list, list]:
+    """Stratified 50/50 split of the target cohort's patients into a
+    harmonization half (the only part of this cohort that enters the
+    harmonization model's training/val data) and a held-out half (never
+    touches training in any way -- not the harmonization model, not the
+    classifier -- and is only scored once at the end on the finished
+    model). Fixed random_state so the same held-out half is used
+    regardless of torch_seed.
+    """
+    harmonization_half, heldout_half = train_test_split(
+        patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
+        stratify=[p.label for p in patients],
+    )
+    return harmonization_half, heldout_half
 
 
 def encode_patients(
@@ -103,22 +169,39 @@ def eval_set(model, clf, plist, prob_override=None) -> dict | None:
     }
 
 
-def train_model_once(torch_seed: int, all_cohorts: dict) -> tuple[HarmonizationModel, dict]:
-    """Train the harmonization model ONCE for this seed. Harmonization no
-    longer depends on target_cohort at all -- MMD is fully pooled and
-    label-blind regardless of which cohort you're about to evaluate
-    against -- so training a fresh model per target_cohort combination
-    would just be identical work repeated N times for nothing. Returns the
-    trained model plus cohort_all (all patients per cohort, unsplit) for
-    the evaluation step.
+def train_model_once(
+    torch_seed: int, all_cohorts: dict, target_cohort: str
+) -> tuple[HarmonizationModel, dict, list, list]:
+    """Train the harmonization model for this (torch_seed, target_cohort)
+    combination.
+
+    Only a stratified 50% of the target cohort's patients (the
+    "harmonization half", from split_target_cohort) enters the
+    harmonization model's training/val data at all. The other 50% (the
+    "held-out half") never touches training -- not the harmonization
+    model, not the classifier -- and is reserved for the final
+    evaluation only. Known (non-target) cohorts are unaffected and still
+    contribute all of their patients. Because the training data
+    composition now changes with target_cohort, the model can no longer
+    be trained once per seed and reused across all three target_cohort
+    rotations -- it's retrained for each (seed, target_cohort) pair.
+
+    Returns the trained model, cohort_all (all patients per cohort,
+    unsplit -- used for known-cohort evaluation and classifier fitting),
+    the target cohort's harmonization half (patients the model DID see,
+    useful as a diagnostic), and the target cohort's held-out half
+    (patients the model never saw, the real test).
     """
+    target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
+
     cohort_train, cohort_val, cohort_all = {}, {}, {}
     for name in COHORT_NAMES:
-        patients = all_cohorts[name]
-        cohort_all[name] = patients
+        cohort_all[name] = all_cohorts[name]  # full cohort, unsplit -- for eval/classifier fitting
+        patients_for_training = target_harmonization if name == target_cohort else all_cohorts[name]
+
         train_p, val_p = train_test_split(
-            patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
-            stratify=[p.label for p in patients],
+            patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
+            stratify=[p.label for p in patients_for_training],
         )
         cohort_train[name] = train_p
         cohort_val[name] = val_p
@@ -131,16 +214,27 @@ def train_model_once(torch_seed: int, all_cohorts: dict) -> tuple[HarmonizationM
         n_epochs=N_EPOCHS,
         lambda_mmd=LAMBDA_MMD,
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
+        latent_gamma_mode=LATENT_GAMMA_MODE,
         checkpoint_path=None,
+        patience=PATIENCE,
     )
-    return model, cohort_all
+    return model, cohort_all, target_harmonization, target_heldout
 
 
-def evaluate_target(torch_seed: int, model: HarmonizationModel, cohort_all: dict, target_cohort: str) -> dict:
+def evaluate_target(
+    torch_seed: int,
+    model: HarmonizationModel,
+    cohort_all: dict,
+    target_cohort: str,
+    target_harmonization: list,
+    target_heldout: list,
+) -> dict:
     """Fit the classifier on the known (non-target) cohorts' LABELS and
-    evaluate on target_cohort -- reuses an already-trained model, doesn't
-    retrain anything. This is the part that actually varies per
-    (target_cohort, torch_seed) combination now.
+    evaluate on the target cohort's held-out half -- the classifier never
+    sees target-cohort labels either way, but now the headline result
+    (target_cohort_raw / target_cohort_corrected) is scored only on
+    patients the harmonization model never trained on at all, not just
+    patients the classifier didn't fit on.
     """
     known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
 
@@ -148,11 +242,15 @@ def evaluate_target(torch_seed: int, model: HarmonizationModel, cohort_all: dict
     # pooled together -- this is the multi-cohort analogue of "fit on all
     # of AUGSBURG" in the 2-cohort script, generalized to N-1 known cohorts.
     known_patients = [p for name in known_cohorts for p in cohort_all[name]]
-    Z_train, y_train = encode_patients(model, known_patients)
+    Z_known, y_known = encode_patients(model, known_patients)
     clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
-    clf.fit(Z_train, y_train)
+    clf.fit(Z_known, y_known)
 
-    target_patients = cohort_all[target_cohort]
+    # The headline result: the held-out half of the target cohort. This
+    # data never entered the harmonization model's training/val split
+    # (see split_target_cohort / train_model_once) and never entered the
+    # classifier fit either -- it's untouched until this line.
+    target_patients = target_heldout
 
     # -- z-score correction: align target cohort's predicted-probability ---
     # distribution to the POOLED known cohorts' -- i.e. exactly the same
@@ -160,27 +258,24 @@ def evaluate_target(torch_seed: int, model: HarmonizationModel, cohort_all: dict
     # 0.5 threshold is calibrated against that pooled distribution by
     # construction (that's what .fit() saw), so that's the correct
     # reference to measure target's shift against -- not a single cohort.
-    # (A single-cohort reference was tried here previously, reasoning that
-    # pooling two possibly-shifted cohorts gives a statistically murky
-    # blended reference. True in the abstract, but beside the point: the
-    # correction's job is to match what the classifier actually expects,
-    # and that's defined by its training distribution, murky or not --
-    # using a single cohort just measures target against the wrong
-    # baseline instead. Never uses target's own labels either way, same
-    # principle as the 2-cohort script's use of zscore_shift_correct.)
-    Z_known_full, _ = encode_patients(model, known_patients)
-    Z_target_full, _ = encode_patients(model, target_patients)
-    prob_known = clf.predict_proba(Z_known_full)[:, 1]
-    prob_target = clf.predict_proba(Z_target_full)[:, 1]
+    # Never uses target's own labels either way, same principle as the
+    # 2-cohort script's use of zscore_shift_correct.
+    prob_known = clf.predict_proba(Z_known)[:, 1]
+    Z_target, _ = encode_patients(model, target_patients)
+    prob_target = clf.predict_proba(Z_target)[:, 1]
     prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
 
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
         "known_cohorts": known_cohorts,
-        "known_cohort_insample": eval_set(model, clf, known_patients),                                  # in-sample, reference only
-        "target_cohort_raw": eval_set(model, clf, target_patients),                                      # raw -- the headline cross-cohort result
-        "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),  # z-score corrected
+        "known_cohort_insample": eval_set(model, clf, known_patients),   # in-sample, reference only
+        # diagnostic: patients from the target cohort that the harmonization
+        # model DID train on (unsupervised) but the classifier never saw --
+        # useful to compare against the truly-unseen result below
+        "target_cohort_harmonization_half": eval_set(model, clf, target_harmonization),
+        "target_cohort_raw": eval_set(model, clf, target_patients),      # held-out half -- never seen by anything, raw
+        "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),  # held-out half, z-score corrected
     }
 
 
@@ -239,38 +334,76 @@ if __name__ == "__main__":
         if name not in all_cohorts:
             raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
 
-    # Always run fresh -- no resume/skip logic. Truncate results_path up
-    # front so this run's results aren't mixed with any prior run's.
+    # -- resume/fresh setup ---------------------------------------------
+    # --fresh (or no prior file) -> nothing to resume, empty start.
+    # Otherwise: load prior runs, keep only seeds that are BOTH complete
+    # (every cohort covered) AND still requested in the current TORCH_SEEDS
+    # (so shrinking/changing the seed list doesn't silently keep averaging
+    # in seeds you no longer asked for). Anything else -- incomplete seeds,
+    # seeds outside the current list, all prior "summary" lines -- is
+    # dropped; results_path is then rewritten to contain exactly the kept
+    # run records, so it never carries stale rows or a stale summary
+    # forward into this run.
+    existing_runs = [] if args.fresh else load_existing_results(results_path)
+    done_seeds = complete_seeds(existing_runs, COHORT_NAMES) & set(TORCH_SEEDS)
+    results = [r for r in existing_runs if r["torch_seed"] in done_seeds]
+
+    discarded_seeds = {r["torch_seed"] for r in existing_runs} - done_seeds
+    if discarded_seeds:
+        print(f"discarding incomplete/outdated seed(s) found in {results_path}: "
+              f"{sorted(discarded_seeds)} (redoing from scratch)")
+
     results_path.write_text("")
+    for r in results:
+        append_result(r, results_path)
 
-    results = []
-    for torch_seed in TORCH_SEEDS:
-        print(f"\n{'='*60}\nTORCH SEED {torch_seed}  (training once, evaluating against: {COHORT_NAMES})\n{'='*60}")
-        model, cohort_all = train_model_once(torch_seed, all_cohorts)
+    seeds_to_run = [s for s in TORCH_SEEDS if s not in done_seeds]
+    if args.fresh:
+        print(f"--fresh: running all {len(seeds_to_run)} seeds: {seeds_to_run}")
+    elif done_seeds:
+        print(f"resuming: {len(done_seeds)} seed(s) already complete {sorted(done_seeds)}, "
+              f"running {len(seeds_to_run)} more: {seeds_to_run}")
+    else:
+        print(f"no usable prior results -- running all {len(seeds_to_run)} seeds: {seeds_to_run}")
 
+    for torch_seed in seeds_to_run:
         for target_cohort in COHORT_NAMES:
-            print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} ---")
-            r = evaluate_target(torch_seed, model, cohort_all, target_cohort)
+            print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
+                  f"(50% of {target_cohort} in training, 50% fully held out)\n{'='*60}")
+            model, cohort_all, target_harmonization, target_heldout = train_model_once(
+                torch_seed, all_cohorts, target_cohort
+            )
+
+            print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} "
+                  f"(held out: {len(target_heldout)}, in-training: {len(target_harmonization)}) ---")
+            r = evaluate_target(
+                torch_seed, model, cohort_all, target_cohort, target_harmonization, target_heldout
+            )
             append_result(r, results_path)   # persist immediately, so a crash doesn't lose this run
             results.append(r)
-            print(f"  known cohorts (in-sample) : {r['known_cohort_insample']}")
-            print(f"  {target_cohort} (target)  : {r['target_cohort_raw']}")
+            print(f"  known cohorts (in-sample)      : {r['known_cohort_insample']}")
+            print(f"  {target_cohort} (harmonization half) : {r['target_cohort_harmonization_half']}")
+            print(f"  {target_cohort} (held out, raw)       : {r['target_cohort_raw']}")
+            print(f"  {target_cohort} (held out, corrected) : {r['target_cohort_corrected']}")
 
     # -- per-target-cohort summaries -----------------------------------------
+    # results here spans EVERY seed in TORCH_SEEDS -- resumed seeds loaded
+    # above plus whatever just ran -- so this averages across all 20 (or
+    # however many), not just the ones run this invocation.
     summary_stats = []
     for target_cohort in COHORT_NAMES:
         subset = [r for r in results if r["target_cohort"] == target_cohort]
         if not subset:
             continue
-        summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (raw, held-out)"))
-        summary_stats.append(summarize(subset, "target_cohort_corrected", f"target={target_cohort} (z-score corrected)"))
+        summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (held-out, raw)"))
+        summary_stats.append(summarize(subset, "target_cohort_corrected", f"target={target_cohort} (held-out, z-score corrected)"))
 
     # -- overall summary across every target-cohort choice -------------------
     # This is the number that actually answers the feasibility question:
     # does harmonization generalize regardless of *which* cohort gets left
     # out, not just for one arbitrarily chosen train/test split.
-    summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (raw, held-out)"))
-    summary_stats.append(summarize(results, "target_cohort_corrected", "ALL target cohorts pooled (z-score corrected)"))
+    summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (held-out, raw)"))
+    summary_stats.append(summarize(results, "target_cohort_corrected", "ALL target cohorts pooled (held-out, z-score corrected)"))
 
     # Appended to the SAME results_path as the per-run records, at the end
     # of the file, each tagged record_type="summary" so a reader can tell

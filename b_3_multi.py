@@ -12,7 +12,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
-DATA_PATH          = "CUBES-Labelled-COHORTS"
+DATA_PATH          = "CUBES-Labelled-COHORTS-ZSCORE"
 DOMAIN_SHIFT_GAMMA = 5.3919e-06
 
 # Replace with your actual cohort names -- order doesn't matter for pairwise,
@@ -131,19 +131,33 @@ def pairwise_mmd(
     zs: dict[str, torch.Tensor],
     gamma_fn=median_heuristic_gamma,
     fixed_gamma: float | None = None,
+    fixed_gammas: dict[tuple[str, str], float] | None = None,
 ) -> tuple[torch.Tensor, dict[tuple[str, str], float]]:
     """Averages POOLED MMD over every cohort pair -- no labels used anywhere.
     Returns the averaged scalar (for the loss) and a dict of each pair's
     individual value (for logging).
 
-    fixed_gamma overrides the per-pair adaptive gamma (used for the
-    image-space logging variant, which needs DOMAIN_SHIFT_GAMMA for
-    comparability with domain_shift.py rather than an adaptive one).
+    fixed_gamma overrides the per-pair adaptive gamma with ONE scalar
+    applied to every pair (used for the image-space logging variant,
+    which needs DOMAIN_SHIFT_GAMMA for comparability with domain_shift.py
+    rather than an adaptive one).
+
+    fixed_gammas overrides with a PER-PAIR dict instead of one shared
+    scalar -- used for the latent-space "gamma frozen at stage-2 start"
+    comparison mode, since different cohort pairs can genuinely sit at
+    different latent-space scales (unlike DOMAIN_SHIFT_GAMMA's single
+    fixed image-space scale, there's no single "correct" fixed latent
+    scale shared across all pairs).
     """
     names = list(zs.keys())
     terms = {}
     for a, b in itertools.combinations(names, 2):
-        gamma = fixed_gamma if fixed_gamma is not None else gamma_fn(zs[a], zs[b])
+        if fixed_gammas is not None:
+            gamma = fixed_gammas[(a, b)]
+        elif fixed_gamma is not None:
+            gamma = fixed_gamma
+        else:
+            gamma = gamma_fn(zs[a], zs[b])
         terms[(a, b)] = compute_mmd(zs[a], zs[b], gamma=gamma)
     avg = torch.stack(list(terms.values())).mean()
     terms_logged = {k: v.item() for k, v in terms.items()}
@@ -189,8 +203,9 @@ def train_harmonization_multi(
     lr: float = 1e-3,
     lambda_mmd: float = 1.0,
     decoder_freeze_epoch: int | None = None,
+    latent_gamma_mode: str = "adaptive",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    patience: int = 200,
+    patience: int = 100,
     checkpoint_path: str | None = "best_harmonization_multi.pt",
 ) -> HarmonizationModel:
     """
@@ -206,18 +221,44 @@ def train_harmonization_multi(
                          stage 1 (epoch < decoder_freeze_epoch) trains
                          encoder+decoder with mmd excluded from the loss
                          entirely (lambda_mmd_t=0), pure reconstruction.
-                         At decoder_freeze_epoch the decoder freezes and mmd
-                         turns on at lambda_mmd; only the encoders adapt
-                         from then on. None disables this (mmd on the whole
-                         run).
+                         At decoder_freeze_epoch the decoder freezes (weights
+                         AND BatchNorm running stats -- see model.decoder.eval()
+                         below) and mmd turns on at lambda_mmd; only the
+                         encoders adapt from then on. None disables this
+                         (mmd on the whole run).
+    latent_gamma_mode : "adaptive" (default) recomputes each pair's
+                         median-heuristic gamma fresh every batch -- the
+                         bandwidth tracks wherever the encoders' latent
+                         scale currently sits, which is a moving target
+                         for the optimizer to align against. "fixed"
+                         computes each pair's gamma ONCE, from the first
+                         training batch at decoder_freeze_epoch (i.e. once
+                         the encoders are already stage-1-trained, not
+                         from random-init noise), then holds that same
+                         per-pair value for the rest of training -- a
+                         static target instead of a moving one. This is
+                         NOT the same as using DOMAIN_SHIFT_GAMMA: that
+                         constant is calibrated for image-space voxel
+                         scale and would be nonsense-scaled for latent
+                         codes; "fixed" here still uses real, data-derived
+                         per-pair bandwidths, just computed once instead
+                         of every batch. Only meaningful when
+                         decoder_freeze_epoch is set -- stage 1 has
+                         lambda_mmd_t=0 regardless, so gamma choice there
+                         never affects gradients either way.
     """
+    if latent_gamma_mode not in ("adaptive", "fixed"):
+        raise ValueError(f"latent_gamma_mode must be 'adaptive' or 'fixed', got {latent_gamma_mode!r}")
+
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     decoder_frozen = False
+    fixed_latent_gammas: dict | None = None   # populated once, at stage-2 start, if mode=="fixed"
     cohort_names = list(cohort_train.keys())
     n_pairs = len(list(itertools.combinations(cohort_names, 2)))
 
     print(f"cohorts      : {cohort_names}  ({n_pairs} pairs, all pooled -- no labels used)")
+    print(f"latent gamma : {latent_gamma_mode}")
     print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}   (image-space, informational only -- not used in the loss)")
     print(f"baseline MMD : 0.096446")
     if decoder_freeze_epoch is not None:
@@ -242,7 +283,16 @@ def train_harmonization_multi(
             model.set_decoder_trainable(False)
             decoder_frozen = True
             trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+            # Rebuild the optimizer around the smaller param set, but carry
+            # over each encoder param's existing Adam state (exp_avg,
+            # exp_avg_sq) instead of restarting momentum at zero right as
+            # lambda_mmd turns on -- params are the same tensor objects
+            # (freezing doesn't recreate them), so this reattaches cleanly.
+            old_state = {p: optimizer.state[p] for p in trainable_params if p in optimizer.state}
             optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
+            optimizer.state.update(old_state)
+
             # val_loss's scale jumps here (mmd term switches on): reset both
             # the patience counter AND best_val_loss -- see 2-cohort version
             # for why keeping only the counter reset silently pins the
@@ -258,10 +308,17 @@ def train_harmonization_multi(
 
         # -- training --------------------------------------------------
         model.train()
+        if decoder_frozen:
+            # requires_grad=False alone doesn't stop BatchNorm running-stat
+            # updates -- model.train() above puts the decoder's BN layers
+            # back in train mode every epoch. eval() here keeps the decoder
+            # a genuinely fixed function during stage 2, not just fixed
+            # weights with still-drifting normalization.
+            model.decoder.eval()
+
         train_recon      = 0.0
         train_mmd_latent = 0.0
         train_mmd_image  = 0.0
-        n_train = 0
         n_train_batches = 0
 
         for batch_dict in _cycling_batches(train_loaders):
@@ -277,7 +334,18 @@ def train_harmonization_multi(
                 x_hats[name] = x_hat.flatten(start_dim=1)   # flatten for MMD's cdist
                 xs[name] = vol
 
-            mmd_latent, _ = pairwise_mmd(zs)  # adaptive per-pair gamma, drives the loss
+            # "fixed" mode: capture each pair's gamma ONCE, from the first
+            # training batch at/after decoder_freeze_epoch (encoders are
+            # already stage-1-trained by then, not random-init noise), then
+            # reuse that same per-pair value for the rest of training.
+            if latent_gamma_mode == "fixed" and decoder_frozen and fixed_latent_gammas is None:
+                fixed_latent_gammas = {
+                    pair: median_heuristic_gamma(zs[pair[0]], zs[pair[1]])
+                    for pair in itertools.combinations(cohort_names, 2)
+                }
+                print(f"epoch {epoch:3d}  -- latent gamma frozen at stage-2 start: {fixed_latent_gammas}")
+
+            mmd_latent, _ = pairwise_mmd(zs, fixed_gammas=fixed_latent_gammas)
             loss = recon + lambda_mmd_t * mmd_latent
 
             loss.backward()
@@ -286,14 +354,15 @@ def train_harmonization_multi(
             with torch.no_grad():
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
-            n = sum(v.size(0) for v in batch_dict.values())
-            train_recon      += recon.item() * n
+            # recon is a sum of already batch-mean-reduced F.mse_loss terms --
+            # a per-batch quantity, same footing as mmd_latent/mmd_image --
+            # so it accumulates and averages over n_train_batches like they do.
+            train_recon      += recon.item()
             train_mmd_latent += mmd_latent.item()
             train_mmd_image  += mmd_image.item()
-            n_train     += n
             n_train_batches += 1
 
-        train_recon      /= max(n_train, 1)
+        train_recon      /= max(n_train_batches, 1)
         train_mmd_latent /= max(n_train_batches, 1)
         train_mmd_image  /= max(n_train_batches, 1)
         train_loss = train_recon + lambda_mmd_t * train_mmd_latent
@@ -303,7 +372,6 @@ def train_harmonization_multi(
         val_recon      = 0.0
         val_mmd_latent = 0.0
         val_mmd_image  = 0.0
-        n_val = 0
         n_val_batches = 0
 
         with torch.no_grad():
@@ -317,17 +385,15 @@ def train_harmonization_multi(
                     zs[name] = z
                     x_hats[name] = x_hat.flatten(start_dim=1)
 
-                mmd_latent, _ = pairwise_mmd(zs)
+                mmd_latent, _ = pairwise_mmd(zs, fixed_gammas=fixed_latent_gammas)
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
-                n = sum(v.size(0) for v in batch_dict.values())
-                val_recon      += recon.item() * n
+                val_recon      += recon.item()
                 val_mmd_latent += mmd_latent.item()
                 val_mmd_image  += mmd_image.item()
-                n_val     += n
                 n_val_batches += 1
 
-        val_recon      /= max(n_val, 1)
+        val_recon      /= max(n_val_batches, 1)
         val_mmd_latent /= max(n_val_batches, 1)
         val_mmd_image  /= max(n_val_batches, 1)
         val_loss = val_recon + lambda_mmd_t * val_mmd_latent

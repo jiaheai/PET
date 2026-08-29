@@ -12,8 +12,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
-DATA_PATH          = "CUBES-Labelled-COHORTS-ZSCORE"
-DOMAIN_SHIFT_GAMMA = 5.3919e-06
+DATA_PATH = "CUBES-Labelled-COHORTS-ZSCORE"
 
 
 class Encoder3D(nn.Module):
@@ -60,25 +59,22 @@ class Decoder3D(nn.Module):
 
 
 class HarmonizationModel(nn.Module):
+    """Shared encoder/decoder across an arbitrary number of cohorts."""
+
     def __init__(self, latent_dim: int = 64):
         super().__init__()
         self.encoder = Encoder3D(latent_dim)
         self.decoder = Decoder3D(latent_dim)
 
-    def forward(self, x_aug: torch.Tensor, x_pr: torch.Tensor):
-        z_aug = self.encoder(x_aug)
-        z_pr  = self.encoder(x_pr)
-        x_hat_aug = self.decoder(z_aug)
-        x_hat_pr  = self.decoder(z_pr)
-        return x_hat_aug, x_hat_pr, z_aug, z_pr
+    def forward(self, xs: list[torch.Tensor]):
+        """xs: list of per-cohort batches, same shared encoder/decoder for each.
+        Returns (x_hats, zs), both lists in the same cohort order as xs.
+        """
+        zs = [self.encoder(x) for x in xs]
+        x_hats = [self.decoder(z) for z in zs]
+        return x_hats, zs
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
-
-    def encode_aug(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
-
-    def encode_pr(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)
 
     def set_decoder_trainable(self, trainable: bool) -> None:
@@ -90,12 +86,7 @@ class HarmonizationModel(nn.Module):
 # -- MMD loss ------------------------------------------------------------
 
 def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
-    """RBF-kernel MMD.
-
-    x, y: (N, D) and (M, D) -- flattened tensors (image-space voxels or
-    latent codes, caller's choice; gamma must match the scale of whichever
-    is passed in).
-    """
+    """RBF-kernel MMD between two cohorts' latents (or flattened voxels)."""
     def rbf(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.exp(-gamma * torch.cdist(a, b).pow(2))
 
@@ -107,16 +98,7 @@ def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
 
 def median_heuristic_gamma(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
     """Median-heuristic RBF bandwidth: gamma = 1 / (2 * median(pairwise sq dist)).
-
-    DOMAIN_SHIFT_GAMMA is a fixed constant tuned for image-space voxel scale
-    (to match domain_shift.py). Latent codes have no such fixed, known scale
-    -- raw nn.Linear output, unbounded and free to drift during training --
-    so a fixed gamma there would give a kernel with no signal at either
-    extreme. The median heuristic instead reads the bandwidth off the
-    actual batch each step, adapting as the latent scale shifts.
-
-    Computed under no_grad -- this only chooses a bandwidth constant, it
-    isn't meant to be differentiated through.
+    Computed under no_grad -- chooses a bandwidth constant, not differentiated through.
     """
     pooled = torch.cat([x, y], dim=0)
     with torch.no_grad():
@@ -130,36 +112,30 @@ def median_heuristic_gamma(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) 
     return gamma.item()
 
 
-def compute_mmd_stratified(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    labels_x: torch.Tensor,
-    labels_y: torch.Tensor,
-    gamma: float,
-) -> torch.Tensor:
-    """Label-stratified MMD: averages MMD within each shared label instead of
-    matching the pooled batch distribution. Prevents the model from closing
-    the aug/pr gap by blurring label-specific features when the two cohorts
-    have different label mixes.
-
-    gamma is computed once from the full (unstratified) batch by the caller
-    and reused across all label subsets here -- estimating it separately per
-    label would be noisy with only a handful of samples per label per batch.
-
-    Falls back to 0.0 (not the pooled MMD) if no label has >=2 samples on
-    both sides in this batch.
+def compute_mmd_multi(zs: list[torch.Tensor]) -> torch.Tensor:
+    """Pairwise MMD across N cohorts, averaged over all C(N,2) pairs.
+    Each pair gets its own median-heuristic gamma (pairs can sit at
+    different scales in latent space). Averaging (not summing) keeps
+    lambda_mmd's effective scale roughly stable as cohort count changes --
+    with N=2 there's exactly one pair, so this matches the old 2-cohort
+    behavior exactly.
     """
-    shared_labels = set(labels_x.tolist()) & set(labels_y.tolist())
-    per_label = []
-    for lbl in shared_labels:
-        xi = x[labels_x == lbl]
-        yi = y[labels_y == lbl]
-        if xi.size(0) < 2 or yi.size(0) < 2:
-            continue
-        per_label.append(compute_mmd(xi, yi, gamma))
-    if not per_label:
-        return torch.zeros((), device=x.device, dtype=x.dtype)
-    return torch.stack(per_label).mean()
+    pairs = list(itertools.combinations(range(len(zs)), 2))
+    if not pairs:
+        return torch.zeros((), device=zs[0].device)
+    total = 0.0
+    for i, j in pairs:
+        gamma = median_heuristic_gamma(zs[i], zs[j])
+        total = total + compute_mmd(zs[i], zs[j], gamma=gamma)
+    return total / len(pairs)
+
+
+def compute_mmd_stratified(*args, **kwargs):
+    raise NotImplementedError(
+        "compute_mmd_stratified was removed: it required target-cohort labels, "
+        "which aren't available at deployment time for a real unlabeled target "
+        "cohort. Use compute_mmd_multi(zs) instead -- pooled, no labels needed."
+    )
 
 
 # -- dataset ------------------------------------------------------------
@@ -171,18 +147,26 @@ class VolumeDataset(Dataset):
     def __len__(self) -> int:
         return len(self.patients)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        patient = self.patients[idx]
-        vol = patient.pet_masked.astype("float32")
-        label = torch.tensor(int(patient.label), dtype=torch.long)
-        return torch.from_numpy(vol).unsqueeze(0), label   # (1, 32, 32, 32), scalar
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        vol = self.patients[idx].pet_masked.astype("float32")
+        return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
+
+
+def _zip_cycled(loaders: list[DataLoader]):
+    """zip N loaders together, cycling all but the longest so every batch
+    from the longest loader gets paired with something from every other
+    cohort (generalizes the old 2-loader `if len(a) >= len(b)` cycling)."""
+    lengths = [len(l) for l in loaders]
+    max_len = max(lengths)
+    cycled = [l if len(l) == max_len else itertools.cycle(l) for l in loaders]
+    return zip(*cycled)
 
 
 # -- training loop ------------------------------------------------------------
 
 def train_harmonization(
     model: HarmonizationModel,
-    train_aug: list, val_aug: list, train_pr: list, val_pr: list,
+    train_cohorts: dict[str, list], val_cohorts: dict[str, list],
     n_epochs: int = 100, batch_size: int = 8, lr: float = 1e-3,
     lambda_mmd: float = 1.0,
     decoder_freeze_epoch: int | None = None,
@@ -191,6 +175,8 @@ def train_harmonization(
     checkpoint_path: str | None = "best_harmonization_shared.pt",
 ) -> HarmonizationModel:
     """
+    train_cohorts / val_cohorts : {cohort_name: [patients]} -- any number of
+                         cohorts (2 or more), all sharing one encoder/decoder.
     decoder_freeze_epoch : if set, splits training into two stages:
                          stage 1 (epoch < decoder_freeze_epoch) trains the
                          full model (encoder + decoder) with the mmd term
@@ -208,15 +194,20 @@ def train_harmonization(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     decoder_frozen = False
 
-    print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}   (image-space, informational only -- not used in the loss)")
-    print(f"baseline MMD : 0.096446")
+    cohort_names = list(train_cohorts.keys())
+    n_pairs = len(list(itertools.combinations(cohort_names, 2)))
+    print(f"cohorts      : {cohort_names}  ({n_pairs} pairs for MMD)")
     if decoder_freeze_epoch is not None:
         print(f"decoder freeze at epoch {decoder_freeze_epoch} (stage-2 encoder-only training)")
 
-    train_aug_loader = DataLoader(VolumeDataset(train_aug), batch_size=batch_size, shuffle=True)
-    train_pr_loader  = DataLoader(VolumeDataset(train_pr),  batch_size=batch_size, shuffle=True)
-    val_aug_loader   = DataLoader(VolumeDataset(val_aug),   batch_size=batch_size, shuffle=False)
-    val_pr_loader    = DataLoader(VolumeDataset(val_pr),    batch_size=batch_size, shuffle=False)
+    train_loaders = [
+        DataLoader(VolumeDataset(train_cohorts[name]), batch_size=batch_size, shuffle=True)
+        for name in cohort_names
+    ]
+    val_loaders = [
+        DataLoader(VolumeDataset(val_cohorts[name]), batch_size=batch_size, shuffle=False)
+        for name in cohort_names
+    ]
 
     best_val_loss = float("inf")
     best_epoch = -1
@@ -232,21 +223,10 @@ def train_harmonization(
             optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
             # val_loss's scale jumps here (mmd term switches on): reset both
             # the patience counter AND best_val_loss, not just the counter.
-            # Otherwise every stage-2 val_loss (which now includes a
-            # non-negative mmd term) is compared against stage-1's best
-            # (pure recon, no mmd added) and can essentially never win --
-            # the final checkpoint would silently stay pinned to a
-            # pre-freeze, pre-harmonization snapshot no matter how long
-            # stage 2 runs.
             epochs_since_improvement = 0
             best_val_loss = float("inf")
             print(f"epoch {epoch:3d}  -- decoder frozen, mmd turned on (lambda_mmd={lambda_mmd}), optimizing encoder only from here on")
 
-        # Stage 1 (epoch < decoder_freeze_epoch): pure reconstruction, mmd
-        # term excluded from the loss entirely -- not just small, exactly 0.
-        # Stage 2 (epoch >= decoder_freeze_epoch, decoder frozen): mmd turns
-        # on at its full target weight and only the encoder can respond to it.
-        # If decoder_freeze_epoch is None, mmd is on at lambda_mmd the whole run.
         if decoder_freeze_epoch is not None and epoch < decoder_freeze_epoch:
             lambda_mmd_t = 0.0
         else:
@@ -254,114 +234,67 @@ def train_harmonization(
 
         # -- training --------------------------------------------------
         model.train()
-        train_recon      = 0.0
-        train_mmd_latent = 0.0   # drives the loss
-        train_mmd_image  = 0.0   # logged only, for domain_shift.py comparability
-        n_train = 0
+        train_recon      = 0.0   # mean per-batch, NOT sample-weighted (mse_loss is already mean-reduced)
+        train_mmd_latent = 0.0   # drives the loss -- averaged over all cohort pairs
         n_train_batches = 0
 
-        if len(train_aug_loader) >= len(train_pr_loader):
-            train_iter = zip(train_aug_loader, itertools.cycle(train_pr_loader))
-        else:
-            train_iter = zip(itertools.cycle(train_aug_loader), train_pr_loader)
-
-        for (batch_aug, label_aug), (batch_pr, label_pr) in train_iter:
-            batch_aug = batch_aug.to(device)
-            batch_pr  = batch_pr.to(device)
-            label_aug = label_aug.to(device)
-            label_pr  = label_pr.to(device)
+        for batches in _zip_cycled(train_loaders):
+            batches = [b.to(device) for b in batches]
 
             optimizer.zero_grad()
-            x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
+            x_hats, zs = model(batches)
 
-            recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
+            recon = sum(F.mse_loss(xh, x) for xh, x in zip(x_hats, batches))
 
             # Latent-space MMD drives the loss: aligns the encoder's codes
-            # for the two cohorts instead of asking two different patients'
-            # reconstructed pixels to match.
-            latent_gamma = median_heuristic_gamma(z_aug, z_pr)
-            mmd_latent = compute_mmd_stratified(
-                z_aug, z_pr, label_aug, label_pr, gamma=latent_gamma,
-            )
+            # across all cohorts (averaged over every pair) instead of
+            # asking different patients' reconstructed pixels to match.
+            # Pooled per pair -- NOT label-stratified, since a real
+            # deployment-time target cohort won't have labels.
+            mmd_latent = compute_mmd_multi(zs)
             loss = recon + lambda_mmd_t * mmd_latent
 
             loss.backward()
             optimizer.step()
 
-            # Image-space MMD: logged only (not in loss), kept purely so the
-            # printed number stays in the same units as domain_shift.py's
-            # metric -- it does NOT receive gradients or affect training.
-            with torch.no_grad():
-                mmd_image = compute_mmd_stratified(
-                    x_hat_aug.flatten(start_dim=1),
-                    x_hat_pr.flatten(start_dim=1),
-                    label_aug, label_pr, gamma=DOMAIN_SHIFT_GAMMA,
-                )
-
-            n = batch_aug.size(0) + batch_pr.size(0)
-            train_recon      += recon.item() * n
+            train_recon      += recon.item()
             train_mmd_latent += mmd_latent.item()
-            train_mmd_image  += mmd_image.item()
-            n_train     += n
-            n_train_batches += 1
+            n_train_batches  += 1
 
-        train_recon      /= max(n_train, 1)
+        train_recon      /= max(n_train_batches, 1)
         train_mmd_latent /= max(n_train_batches, 1)
-        train_mmd_image  /= max(n_train_batches, 1)
         train_loss = train_recon + lambda_mmd_t * train_mmd_latent
 
         # -- validation --------------------------------------------------
         model.eval()
         val_recon      = 0.0
         val_mmd_latent = 0.0
-        val_mmd_image  = 0.0
-        n_val = 0
         n_val_batches = 0
 
-        if len(val_aug_loader) >= len(val_pr_loader):
-            val_iter = zip(val_aug_loader, itertools.cycle(val_pr_loader))
-        else:
-            val_iter = zip(itertools.cycle(val_aug_loader), val_pr_loader)
-
         with torch.no_grad():
-            for (batch_aug, label_aug), (batch_pr, label_pr) in val_iter:
-                batch_aug = batch_aug.to(device)
-                batch_pr  = batch_pr.to(device)
-                label_aug = label_aug.to(device)
-                label_pr  = label_pr.to(device)
+            for batches in _zip_cycled(val_loaders):
+                batches = [b.to(device) for b in batches]
 
-                x_hat_aug, x_hat_pr, z_aug, z_pr = model(batch_aug, batch_pr)
+                x_hats, zs = model(batches)
 
-                recon = F.mse_loss(x_hat_aug, batch_aug) + F.mse_loss(x_hat_pr, batch_pr)
-                latent_gamma = median_heuristic_gamma(z_aug, z_pr)
-                mmd_latent = compute_mmd_stratified(
-                    z_aug, z_pr, label_aug, label_pr, gamma=latent_gamma,
-                )
-                mmd_image = compute_mmd_stratified(
-                    x_hat_aug.flatten(start_dim=1),
-                    x_hat_pr.flatten(start_dim=1),
-                    label_aug, label_pr, gamma=DOMAIN_SHIFT_GAMMA,
-                )
+                recon = sum(F.mse_loss(xh, x) for xh, x in zip(x_hats, batches))
+                mmd_latent = compute_mmd_multi(zs)
 
-                n = batch_aug.size(0) + batch_pr.size(0)
-                val_recon      += recon.item() * n
+                val_recon      += recon.item()
                 val_mmd_latent += mmd_latent.item()
-                val_mmd_image  += mmd_image.item()
-                n_val     += n
-                n_val_batches += 1
+                n_val_batches  += 1
 
-        val_recon      /= max(n_val, 1)
+        val_recon      /= max(n_val_batches, 1)
         val_mmd_latent /= max(n_val_batches, 1)
-        val_mmd_image  /= max(n_val_batches, 1)
         val_loss = val_recon + lambda_mmd_t * val_mmd_latent
 
         if epoch % 10 == 0 or epoch == n_epochs - 1:
             print(
                 f"epoch {epoch:3d}  lambda_mmd {lambda_mmd_t:.4f}  "
                 f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  "
-                f"mmd_z {train_mmd_latent:.6f}  mmd_img {train_mmd_image:.6f})  "
+                f"mmd_z {train_mmd_latent:.6f})  "
                 f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  "
-                f"mmd_z {val_mmd_latent:.6f}  mmd_img {val_mmd_image:.6f})"
+                f"mmd_z {val_mmd_latent:.6f})"
             )
 
         if val_loss < best_val_loss:
@@ -397,9 +330,6 @@ def save_harmonized_reconstructions(
     import nibabel as nib
     from pathlib import Path as _Path
 
-    if cohort not in ("AUGSBURG", "PRE-RAPID"):
-        raise ValueError(f"Unknown cohort '{cohort}'. Expected 'AUGSBURG' or 'PRE-RAPID'.")
-
     out_root = _Path(out_root)
     model = model.to(device)
     model.eval()
@@ -430,36 +360,32 @@ if __name__ == "__main__":
     models_dir = Path("models")
     models_dir.mkdir(exist_ok=True)
 
-    all_cohorts = load_all_cohorts(Path(DATA_PATH))
+    all_cohorts = load_all_cohorts(Path(DATA_PATH))   # {cohort_name: [patients]}, any number of cohorts
 
-    aug_patients = all_cohorts["AUGSBURG"]
-    pr_patients  = all_cohorts["PRE-RAPID"]
+    train_cohorts: dict[str, list] = {}
+    val_cohorts: dict[str, list] = {}
 
-    # stratified so val doesn't accidentally end up class-skewed at n~10
-    train_aug, val_aug = train_test_split(
-        aug_patients, test_size=0.2, random_state=40,
-        stratify=[p.label for p in aug_patients],
-    )
-    train_pr, val_pr = train_test_split(
-        pr_patients, test_size=0.2, random_state=40,
-        stratify=[p.label for p in pr_patients],
-    )
-
-    print(f"AUGSBURG : {len(train_aug)} train / {len(val_aug)} val  (all {len(aug_patients)} used)")
-    print(f"PRE-RAPID: {len(train_pr)} train / {len(val_pr)} val  (all {len(pr_patients)} used)")
+    for name, patients in all_cohorts.items():
+        # stratified so val doesn't accidentally end up class-skewed at small n
+        train_p, val_p = train_test_split(
+            patients, test_size=0.2, random_state=40,
+            stratify=[p.label for p in patients],
+        )
+        train_cohorts[name] = train_p
+        val_cohorts[name] = val_p
+        print(f"{name:10s}: {len(train_p)} train / {len(val_p)} val  (all {len(patients)} used)")
 
     torch.manual_seed(41)
     model = HarmonizationModel(latent_dim=64)
 
     model = train_harmonization(
         model,
-        train_aug=train_aug, val_aug=val_aug,
-        train_pr=train_pr, val_pr=val_pr,
+        train_cohorts=train_cohorts, val_cohorts=val_cohorts,
         n_epochs=1000,
         lambda_mmd=1,
         decoder_freeze_epoch=100,
         checkpoint_path=str(models_dir / "best_harmonization_shared.pt"),
     )
 
-    save_harmonized_reconstructions(model, aug_patients, "AUGSBURG")
-    save_harmonized_reconstructions(model, pr_patients, "PRE-RAPID")
+    for name, patients in all_cohorts.items():
+        save_harmonized_reconstructions(model, patients, name)

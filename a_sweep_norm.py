@@ -1,3 +1,21 @@
+"""
+Approach A, leave-one-cohort-out sweep across 3 cohorts.
+
+Approach A's shared single encoder means MMD only ever needs two groups
+of volumes to compare -- it never dispatches per-cohort the way the
+multi-encoder approach (b_3_multi/b_3_anchor) does. So the natural 3+
+cohort adaptation needs NO changes to a.py itself: train_harmonization's
+"aug" side becomes the POOLED known (non-target) cohorts, and its "pr"
+side becomes target's harmonization-half -- the model directly aligns
+"everything we have labels for" against "the unlabeled target," which is
+arguably a cleaner match for the actual goal than pairwise/anchor
+mechanics need to approximate.
+
+Same 50/50 held-out split as b_sweep_multi.py / cnn_sweep_multi.py, using
+the SAME TARGET_HOLDOUT_SEED -- so target_heldout is identical across all
+three approaches' sweeps, required for a valid cross-approach comparison.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,154 +31,223 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from a import HarmonizationModel, train_harmonization
-from classifier import encode_patients
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
-# Defaults -- overridable via --data-path / --results-path for automation
-# (e.g. running the same sweep against raw / -ZSCORE / -HISTMATCH data
-# without editing this file each time).
+# Defaults -- overridable via --data-path / --results-path for automation.
 DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
-DEFAULT_RESULTS_PATH = "a_sweep_norm_results.jsonl"
+DEFAULT_RESULTS_PATH = "a_sweep_multi_results.jsonl"
 
-TRAIN_COHORT   = "AUGSBURG"    # entire cohort -- always the classifier's training set
-HOLDOUT_COHORT = "PRE-RAPID"   # entire cohort -- always the classifier's test set
-
-TORCH_SEEDS    = list(range(5))   # 0..29 -- init/training-stochasticity sweep
-VAL_FRACTION   = 0.2               # per-cohort val split, used only for early stopping
-VAL_SPLIT_SEED = 40                # fixed -- keeps the same val patients across all torch seeds
+COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
+TORCH_SEEDS    = list(range(5))
+VAL_SPLIT_SEED = 40             # fixed -- keeps the same val patients across all torch seeds
+TARGET_HOLDOUT_SEED = 123       # fixed -- SAME value as b_sweep_multi.py / cnn_sweep_multi.py,
+                                 # so target_heldout is identical across every approach's sweep
+LAMBDA_MMD     = 0.7
+DECODER_FREEZE_EPOCH = 100
 N_EPOCHS       = 1000
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Option A sweep (30 seeds, with z-score correction)")
+    parser = argparse.ArgumentParser(
+        description="Approach A, leave-one-cohort-out sweep across all cohort combinations and torch seeds"
+    )
     parser.add_argument(
         "--data-path", default=DEFAULT_DATA_PATH,
-        help=f"Directory containing AUGSBURG/PRE-RAPID cohort data (default: {DEFAULT_DATA_PATH})",
+        help=f"Directory containing all cohorts' data (default: {DEFAULT_DATA_PATH})",
     )
     parser.add_argument(
         "--results-path", default=DEFAULT_RESULTS_PATH,
-        help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}). "
-             "Use a distinct path per data variant so results from different "
-             "preprocessing (raw/z-score/histogram-match) don't get mixed together.",
+        help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}).",
     )
     return parser.parse_args()
 
 
-def load_existing_results(results_path: Path) -> dict[int, dict]:
-    """Load already-completed seed results, keyed by torch seed, so a rerun can skip them.
-
-    NOTE: this version adds "holdout_cohort_corrected" to each result.
-    If results_path was written by an earlier version of this script
-    (missing that field, or the older "threshold" field), delete it
-    before rerunning -- summarize() will KeyError on the missing field
-    otherwise.
-    """
-    if not results_path.exists():
-        return {}
-    results = {}
-    with open(results_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            results[r["torch_seed"]] = r
-    return results
-
-
 def append_result(r: dict, results_path: Path) -> None:
+    r = {"record_type": "run", **r}
     with open(results_path, "a") as f:
         f.write(json.dumps(r) + "\n")
 
 
-def run_one_seed(torch_seed: int, all_cohorts: dict) -> dict:
-    aug_patients = all_cohorts[TRAIN_COHORT]     # all 50
-    pr_patients  = all_cohorts[HOLDOUT_COHORT]   # all 28
+def append_summary(s: dict, results_path: Path) -> None:
+    s = {"record_type": "summary", **s}
+    with open(results_path, "a") as f:
+        f.write(json.dumps(s) + "\n")
 
-    # stratified so val doesn't accidentally end up class-skewed at n~10
-    train_aug, val_aug = train_test_split(
-        aug_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
-        stratify=[p.label for p in aug_patients],
+
+def split_target_cohort(patients: list) -> tuple[list, list]:
+    """Stratified 50/50 split of the target cohort's patients into a
+    harmonization half (enters train_harmonization's "pr" side, unsupervised
+    only) and a held-out half (never touches training in any way -- not
+    the harmonization model, not the classifier). Fixed random_state, same
+    value as the other approaches' sweeps, so all three hold out identical
+    patients.
+    """
+    harmonization_half, heldout_half = train_test_split(
+        patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
+        stratify=[p.label for p in patients],
     )
-    train_pr,  val_pr  = train_test_split(
-        pr_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
-        stratify=[p.label for p in pr_patients],
+    return harmonization_half, heldout_half
+
+
+def encode_patients(
+    model: HarmonizationModel,
+    patients: list,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Encode patients into latent vectors. Approach A has a single shared
+    encoder with no per-cohort dispatch (model.encode(x) takes no cohort
+    argument at all) -- simpler than the multi-encoder approach's version.
+    """
+    model = model.to(device)
+    model.eval()
+    zs, ys = [], []
+    with torch.no_grad():
+        for patient in patients:
+            vol = (
+                torch.from_numpy(patient.pet_masked.astype("float32"))
+                .unsqueeze(0).unsqueeze(0)
+                .to(device)
+            )
+            z = model.encode(vol).squeeze(0).cpu().numpy()
+            zs.append(z)
+            ys.append(patient.label)
+    return np.stack(zs), np.array(ys)
+
+
+def eval_set(model, clf, plist, prob_override=None) -> dict | None:
+    if not plist:
+        return None
+    Z, y = encode_patients(model, plist)
+    y_prob = clf.predict_proba(Z)[:, 1] if prob_override is None else prob_override
+    y_pred = (y_prob >= 0.5).astype(int)
+    acc = accuracy_score(y, y_pred)
+    auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
+    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
+    recall_pos = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    recall_neg = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+    balanced_acc = float(np.nanmean([recall_pos, recall_neg]))
+    return {
+        "acc": float(acc), "auc": float(auc),
+        "recall_pos": float(recall_pos), "recall_neg": float(recall_neg),
+        "balanced_acc": balanced_acc,
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
+
+
+def train_model_once(
+    torch_seed: int, all_cohorts: dict, target_cohort: str
+) -> tuple[HarmonizationModel, dict, list, list]:
+    """Train Approach A's shared-encoder model for this (torch_seed,
+    target_cohort) combination. train_harmonization's "aug" side is the
+    POOLED known (non-target) cohorts; its "pr" side is target's
+    harmonization-half -- the model has no concept of individual cohort
+    identity beyond this train-time split, since the encoder is fully
+    shared. Retrained per (seed, target_cohort) pair, same reason as the
+    other sweeps: the training data composition changes with target_cohort.
+    """
+    target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
+
+    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
+    known_patients = [p for name in known_cohorts for p in all_cohorts[name]]
+
+    train_known, val_known = train_test_split(
+        known_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in known_patients],
+    )
+    train_target_harm, val_target_harm = train_test_split(
+        target_harmonization, test_size=0.2, random_state=VAL_SPLIT_SEED,
+        stratify=[p.label for p in target_harmonization],
     )
 
     torch.manual_seed(torch_seed)
     model = HarmonizationModel(latent_dim=64)
     model = train_harmonization(
         model,
-        train_aug=train_aug, val_aug=val_aug,
-        train_pr=train_pr,   val_pr=val_pr,
+        train_aug=train_known, val_aug=val_known,           # "aug" side = pooled known cohorts
+        train_pr=train_target_harm, val_pr=val_target_harm,  # "pr" side = target's harmonization-half
         n_epochs=N_EPOCHS,
-        lambda_mmd=0.7,
-        decoder_freeze_epoch=100,
+        lambda_mmd=LAMBDA_MMD,
+        decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
         checkpoint_path=None,
     )
+    return model, all_cohorts, target_harmonization, target_heldout
 
-    # classifier: fit on ALL of AUGSBURG, test on ALL of PRE-RAPID --
-    Z_train, y_train = encode_patients(model, aug_patients)
+
+def evaluate_target(
+    torch_seed: int,
+    model: HarmonizationModel,
+    cohort_all: dict,
+    target_cohort: str,
+    target_harmonization: list,
+    target_heldout: list,
+) -> dict:
+    """Fit the classifier on the known (non-target) cohorts' LABELS and
+    evaluate on target's held-out half -- never seen by the harmonization
+    model (train_harmonization only saw target_harmonization) or the
+    classifier (only ever sees known_patients).
+    """
+    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
+    known_patients = [p for name in known_cohorts for p in cohort_all[name]]
+
+    Z_known, y_known = encode_patients(model, known_patients)
     clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
-    clf.fit(Z_train, y_train)
+    clf.fit(Z_known, y_known)
 
-    def eval_set(plist, prob_override=None):
-        if not plist:
-            return None
-        Z, y = encode_patients(model, plist)
-        y_prob = clf.predict_proba(Z)[:, 1] if prob_override is None else prob_override
-        y_pred = (y_prob >= 0.5).astype(int)
-        acc = accuracy_score(y, y_pred)
-        auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
-        tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
-        recall_pos = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-        recall_neg = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-        balanced_acc = float(np.nanmean([recall_pos, recall_neg]))
-        return {
-            "acc": float(acc), "auc": float(auc),
-            "recall_pos": float(recall_pos), "recall_neg": float(recall_neg),
-            "balanced_acc": balanced_acc,
-            "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
-        }
+    target_patients = target_heldout
 
-    # -- z-score correction: align PRE-RAPID's predicted-probability -----
-    # distribution to AUGSBURG's (unlabeled statistics only, no PRE-RAPID
-    # labels used in computing the correction itself -- same principle
-    # as cnn.py's zscore_shift_correct, applied here to clf's probabilities
-    # instead of the CNN's sigmoid outputs).
-    Z_aug_full, _ = encode_patients(model, aug_patients)
-    Z_pr_full,  _ = encode_patients(model, pr_patients)
-    prob_aug = clf.predict_proba(Z_aug_full)[:, 1]
-    prob_pr  = clf.predict_proba(Z_pr_full)[:, 1]
-    prob_pr_corrected = zscore_shift_correct(prob_source=prob_aug, prob_target=prob_pr)
+    # -- z-score correction: align target's predicted-probability ---
+    # distribution to the POOLED known cohorts' -- exactly the data clf
+    # was fit on. Never uses target's own labels, same principle as the
+    # 2-cohort script's use of zscore_shift_correct.
+    Z_target, _ = encode_patients(model, target_patients)
+    prob_known = clf.predict_proba(Z_known)[:, 1]
+    prob_target = clf.predict_proba(Z_target)[:, 1]
+    prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
 
     return {
         "torch_seed": torch_seed,
-        "train_cohort": eval_set(aug_patients),                              # in-sample AUGSBURG, reference only
-        "holdout_cohort": eval_set(pr_patients),                              # raw -- the original headline result
-        "holdout_cohort_corrected": eval_set(pr_patients, prob_override=prob_pr_corrected),  # z-score corrected
+        "target_cohort": target_cohort,
+        "known_cohorts": known_cohorts,
+        "known_cohort_insample": eval_set(model, clf, known_patients),
+        "target_cohort_harmonization_half": eval_set(model, clf, target_harmonization),
+        "target_cohort_raw": eval_set(model, clf, target_patients),
+        "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),
     }
 
 
-def summarize(results: list, key: str, label: str) -> None:
+def summarize(results: list, key: str, label: str) -> dict:
     accs          = [r[key]["acc"] for r in results if r[key] is not None]
     aucs          = [r[key]["auc"] for r in results if r[key] is not None]
     recalls_pos   = [r[key]["recall_pos"] for r in results if r[key] is not None]
     recalls_neg   = [r[key]["recall_neg"] for r in results if r[key] is not None]
     balanced_accs = [r[key]["balanced_acc"] for r in results if r[key] is not None]
 
-    print(f"\n=== {label} across {len(accs)} torch seeds ===")
+    print(f"\n=== {label} across {len(accs)} runs ===")
     print(f"acc            : {np.nanmean(accs):.3f} +/- {np.nanstd(accs):.3f}")
     print(f"auc            : {np.nanmean(aucs):.3f} +/- {np.nanstd(aucs):.3f}")
     print(f"recall(pos)    : {np.nanmean(recalls_pos):.3f} +/- {np.nanstd(recalls_pos):.3f}")
     print(f"recall(neg)    : {np.nanmean(recalls_neg):.3f} +/- {np.nanstd(recalls_neg):.3f}")
     print(f"balanced acc   : {np.nanmean(balanced_accs):.3f} +/- {np.nanstd(balanced_accs):.3f}")
-    print(f"per-seed acc   : {[round(a, 3) for a in accs]}")
-    print(f"per-seed auc   : {[round(a, 3) for a in aucs]}")
-    print(f"per-seed rec+  : {[round(r, 3) for r in recalls_pos]}")
-    print(f"per-seed rec-  : {[round(r, 3) for r in recalls_neg]}")
-    print(f"per-seed bacc  : {[round(b, 3) for b in balanced_accs]}")
+    print(f"per-run acc    : {[round(a, 3) for a in accs]}")
+    print(f"per-run auc    : {[round(a, 3) for a in aucs]}")
+    print(f"per-run rec+   : {[round(r, 3) for r in recalls_pos]}")
+    print(f"per-run rec-   : {[round(r, 3) for r in recalls_neg]}")
+    print(f"per-run bacc   : {[round(b, 3) for b in balanced_accs]}")
+
+    return {
+        "label": label, "key": key, "n_runs": len(accs),
+        "acc_mean": float(np.nanmean(accs)), "acc_std": float(np.nanstd(accs)),
+        "auc_mean": float(np.nanmean(aucs)), "auc_std": float(np.nanstd(aucs)),
+        "recall_pos_mean": float(np.nanmean(recalls_pos)), "recall_pos_std": float(np.nanstd(recalls_pos)),
+        "recall_neg_mean": float(np.nanmean(recalls_neg)), "recall_neg_std": float(np.nanstd(recalls_neg)),
+        "balanced_acc_mean": float(np.nanmean(balanced_accs)), "balanced_acc_std": float(np.nanstd(balanced_accs)),
+        "per_run_acc": [round(a, 3) for a in accs],
+        "per_run_auc": [round(a, 3) for a in aucs],
+        "per_run_recall_pos": [round(r, 3) for r in recalls_pos],
+        "per_run_recall_neg": [round(r, 3) for r in recalls_neg],
+        "per_run_balanced_acc": [round(b, 3) for b in balanced_accs],
+    }
 
 
 if __name__ == "__main__":
@@ -170,27 +257,49 @@ if __name__ == "__main__":
 
     print(f"data path    : {data_path}")
     print(f"results path : {results_path}")
+    print(f"cohorts      : {COHORT_NAMES}")
 
     all_cohorts = load_all_cohorts(data_path)
+    for name in COHORT_NAMES:
+        if name not in all_cohorts:
+            raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
 
-    existing = load_existing_results(results_path)
-    if existing:
-        print(f"found {len(existing)} completed torch seed(s) in {results_path}, will skip those: "
-              f"{sorted(existing.keys())}")
+    # Always run fresh -- no resume/skip logic. Truncate results_path up
+    # front so this run's results aren't mixed with any prior run's.
+    results_path.write_text("")
 
     results = []
     for torch_seed in TORCH_SEEDS:
-        if torch_seed in existing:
-            results.append(existing[torch_seed])
+        for target_cohort in COHORT_NAMES:
+            print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
+                  f"(50% of {target_cohort} in training [unsupervised], 50% fully held out)\n{'='*60}")
+            model, cohort_all, target_harmonization, target_heldout = train_model_once(
+                torch_seed, all_cohorts, target_cohort
+            )
+
+            print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} "
+                  f"(held out: {len(target_heldout)}, in-training: {len(target_harmonization)}) ---")
+            r = evaluate_target(
+                torch_seed, model, cohort_all, target_cohort, target_harmonization, target_heldout
+            )
+            append_result(r, results_path)
+            results.append(r)
+            print(f"  known cohorts (in-sample)      : {r['known_cohort_insample']}")
+            print(f"  {target_cohort} (harmonization half) : {r['target_cohort_harmonization_half']}")
+            print(f"  {target_cohort} (held out, raw)       : {r['target_cohort_raw']}")
+            print(f"  {target_cohort} (held out, corrected) : {r['target_cohort_corrected']}")
+
+    summary_stats = []
+    for target_cohort in COHORT_NAMES:
+        subset = [r for r in results if r["target_cohort"] == target_cohort]
+        if not subset:
             continue
+        summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (held-out, raw)"))
+        summary_stats.append(summarize(subset, "target_cohort_corrected", f"target={target_cohort} (held-out, z-score corrected)"))
 
-        print(f"\n{'='*60}\nTORCH SEED {torch_seed}\n{'='*60}")
-        r = run_one_seed(torch_seed, all_cohorts)
-        append_result(r, results_path)   # persist immediately, so a crash doesn't lose this seed
-        results.append(r)
-        print(f"  {TRAIN_COHORT} (in-sample): {r['train_cohort']}")
-        print(f"  {HOLDOUT_COHORT} (test)    : {r['holdout_cohort']}")
+    summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (held-out, raw)"))
+    summary_stats.append(summarize(results, "target_cohort_corrected", "ALL target cohorts pooled (held-out, z-score corrected)"))
 
-    summarize(results, "train_cohort", f"{TRAIN_COHORT} (in-sample, reference only)")
-    summarize(results, "holdout_cohort", f"{HOLDOUT_COHORT} (test -- raw, original headline result)")
-    summarize(results, "holdout_cohort_corrected", f"{HOLDOUT_COHORT} (test -- z-score corrected)")
+    for s in summary_stats:
+        append_summary(s, results_path)
+    print(f"\nsummary appended to: {results_path}")

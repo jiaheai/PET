@@ -11,11 +11,12 @@ other cohort. This corrects the cohort-level (site/scanner) intensity
 shift while preserving each patient's intensity relative to their own
 cohort's overall distribution.
 
-AUGSBURG is treated as the reference cohort and saved UNCHANGED.
-PRE-RAPID's pooled voxel distribution is z-score matched onto
-AUGSBURG's pooled mean/std, then every PRE-RAPID patient's volume is
-transformed using that single shared (mu, sigma) pair -- not their own
-individual statistics.
+SWISS is treated as the reference cohort (largest cohort, most stable
+pooled statistics) and saved UNCHANGED. Every other cohort's
+(AUGSBURG, PRE-RAPID) pooled voxel distribution is z-score matched
+onto SWISS's pooled mean/std independently, then every patient in
+that cohort has their volume transformed using their OWN cohort's
+single shared (mu, sigma) pair -- not their own individual statistics.
 
 Usage
 -----
@@ -34,8 +35,8 @@ import numpy as np
 
 from nifti_loader import PatientVolumes, load_all_cohorts
 
-REFERENCE_COHORT = "AUGSBURG"
-TARGET_COHORT    = "PRE-RAPID"
+REFERENCE_COHORT = "SWISS"
+TARGET_COHORTS   = ["AUGSBURG", "PRE-RAPID"]   # each matched onto REFERENCE_COHORT independently
 
 
 def cohort_pooled_stats(patients: list[PatientVolumes]) -> tuple[float, float]:
@@ -125,15 +126,23 @@ def main() -> None:
     for name, plist in all_cohorts.items():
         print(f"  {name}: {len(plist)} patients")
 
+    for name in [REFERENCE_COHORT, *TARGET_COHORTS]:
+        if name not in all_cohorts:
+            raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
+
     reference_patients = all_cohorts[REFERENCE_COHORT]
-    target_patients    = all_cohorts[TARGET_COHORT]
 
-    print(f"\nz-score matching {TARGET_COHORT} onto {REFERENCE_COHORT}'s pooled cohort statistics ...")
-    matched_target = zscore_match_cohort(target_patients, reference_patients)
+    print(f"\nSaving {REFERENCE_COHORT} (unchanged) to {args.output_dir} ...")
+    save_cohort(reference_patients, args.output_dir)   # SWISS saved as-is, unchanged
 
-    print(f"\nSaving {REFERENCE_COHORT} (unchanged) and {TARGET_COHORT} (matched) to {args.output_dir} ...")
-    save_cohort(reference_patients, args.output_dir)   # AUGSBURG saved as-is, unchanged
-    save_cohort(matched_target, args.output_dir)        # PRE-RAPID saved matched
+    for target_cohort in TARGET_COHORTS:
+        target_patients = all_cohorts[target_cohort]
+
+        print(f"\nz-score matching {target_cohort} onto {REFERENCE_COHORT}'s pooled cohort statistics ...")
+        matched_target = zscore_match_cohort(target_patients, reference_patients)
+
+        print(f"Saving {target_cohort} (matched) to {args.output_dir} ...")
+        save_cohort(matched_target, args.output_dir)
 
 
 if __name__ == "__main__":
