@@ -20,14 +20,15 @@ DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "b_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(10))
+TORCH_SEEDS    = list(range(5))
 VAL_SPLIT_SEED = 40
 TARGET_HOLDOUT_SEED = 123   # fixed -- same held-out target half across all torch seeds
 N_EPOCHS       = 1000
 LAMBDA_MMD     = 100
+LAMBDA_CLF     = 1
 LATENT_GAMMA_MODE = "adaptive"
 DECODER_FREEZE_EPOCH = 50
-PATIENCE = 100
+PATIENCE = 10
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +158,7 @@ def train_model_once(
         target_cohort=target_cohort,
         checkpoint_path=None,
         patience=PATIENCE,
+        lambda_clf=LAMBDA_CLF,
     )
     return model, cohort_all, target_harmonization, target_heldout
 

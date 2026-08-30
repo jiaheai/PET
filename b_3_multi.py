@@ -71,6 +71,7 @@ class HarmonizationModel(nn.Module):
         self.cohort_names = list(cohort_names)
         self.encoders = nn.ModuleDict({name: Encoder3D(latent_dim) for name in cohort_names})
         self.decoder = Decoder3D(latent_dim)
+        self.aux_clf = nn.Linear(latent_dim, 1)
 
     def encode(self, cohort_name: str, x: torch.Tensor) -> torch.Tensor:
         return self.encoders[cohort_name](x)
@@ -79,6 +80,14 @@ class HarmonizationModel(nn.Module):
         z = self.encoders[cohort_name](x)
         x_hat = self.decoder(z)
         return x_hat, z
+
+    def classify(self, z: torch.Tensor) -> torch.Tensor:
+        # side-by-side supervision, not sequential fine-tuning: this head
+        # trains ON THE SAME z, in the SAME backward() call, as recon/MMD --
+        # never after them in a separate phase. That's what keeps alignment
+        # pressure (MMD) and separability pressure (this) both active at
+        # once, so the encoder can't satisfy one by sacrificing the other.
+        return self.aux_clf(z).squeeze(-1)
 
     def set_decoder_trainable(self, trainable: bool) -> None:
         for p in self.decoder.parameters():
@@ -175,12 +184,26 @@ class VolumeDataset(Dataset):
         return torch.from_numpy(vol).unsqueeze(0), int(patient.label)
 
 
-def _oversampling_sampler(patients: list, num_samples: int, weighted: bool, replacement: bool) -> WeightedRandomSampler:
-    # weighted=True: inverse-class-frequency, for source cohorts. weighted=False:
-    # uniform, for target -- its labels must never factor into sampling either.
-    # replacement=False (driver, num_samples==len(patients)) draws every patient
-    # exactly once, weights only affecting order; replacement=True (non-driver)
-    # actually oversamples up to num_samples.
+def _oversampling_sampler(
+    patients: list, num_samples: int, weighted: bool, replacement: bool
+) -> WeightedRandomSampler:
+    """Sampler drawing num_samples indices from patients each epoch.
+    replacement=True (non-driver cohorts): random-WITH-replacement, so a
+    smaller cohort seen multiple times per epoch gets a fresh random draw
+    each pass instead of itertools.cycle's fixed, identical, repeated
+    batch sequence -- less repetitive input for BatchNorm running stats.
+    replacement=False (driver cohort): every patient drawn exactly once,
+    same guarantee plain shuffle=True gave the driver before -- weights
+    still influence draw ORDER, not which patients get included, so this
+    stays a full, unbiased epoch even when weighted=True.
+
+    weighted=True: inverse-class-frequency, for source cohorts -- applied
+    regardless of whether that cohort is also the driver, since the driver
+    can be a source cohort once target_cohort shrinks its own training set
+    (target's harmonization half is only 50% of that cohort). weighted=False:
+    uniform, for target -- its labels must never factor into sampling either,
+    not just the loss.
+    """
     if weighted:
         labels = np.array([p.label for p in patients])
         class_counts = np.bincount(labels)
@@ -191,9 +214,9 @@ def _oversampling_sampler(patients: list, num_samples: int, weighted: bool, repl
 
 
 def _cycling_batches(loaders: dict[str, DataLoader]):
-    # train loaders are now all oversampled to the same per-epoch length, so
-    # this cycle() degrades to zip() for them; val loaders are still genuinely
-    # different lengths per cohort and rely on real cycling here.
+    # train loaders are now all sized to match the driver, so this cycle()
+    # degrades to zip() for them; val loaders are still genuinely different
+    # lengths per cohort and rely on real cycling here.
     names = list(loaders.keys())
     lengths = {n: len(loaders[n]) for n in names}
     driver = max(names, key=lambda n: lengths[n])
@@ -210,6 +233,7 @@ def train_harmonization_multi(
     batch_size: int = 8,
     lr: float = 1e-3,
     lambda_mmd: float = 1.0,
+    lambda_clf: float = 1.0,
     decoder_freeze_epoch: int | None = None,
     latent_gamma_mode: str = "adaptive",
     target_cohort: str | None = None,
@@ -217,6 +241,18 @@ def train_harmonization_multi(
     patience: int = 100,
     checkpoint_path: str | None = "best_harmonization_multi.pt",
 ) -> HarmonizationModel:
+    """
+    lambda_clf : weight on model.aux_clf's BCE loss, gated the same way as
+                 lambda_mmd -- 0 during stage 1, lambda_clf from
+                 decoder_freeze_epoch on. Only ever computed on SOURCE
+                 (non-target) cohorts' patients -- same guard that already
+                 keeps target's labels out of batch_labels for stratified
+                 MMD covers this too, since clf_loss is built from that
+                 same dict. Runs alongside recon/mmd in one loss.backward()
+                 call every step (not a separate post-training fine-tune
+                 phase), so MMD's alignment pressure is never absent while
+                 this pushes for separability -- see HarmonizationModel.classify.
+    """
     if latent_gamma_mode not in ("adaptive", "fixed"):
         raise ValueError(f"latent_gamma_mode must be 'adaptive' or 'fixed', got {latent_gamma_mode!r}")
 
@@ -233,16 +269,29 @@ def train_harmonization_multi(
 
     # cohort with the most training patients paces the epoch; every other
     # cohort's train loader oversamples (with replacement) up to that count.
-    # Only source cohorts (not target_cohort) get class-balance weighting --
-    # applied regardless of whether that cohort happens to be the driver,
-    # since the driver can be a source cohort once target_cohort shrinks its
-    # own training set (see the 50/50 split upstream in the sweep script).
+    # Source-cohort class-balance weighting applies regardless of whether
+    # that cohort happens to be the driver.
     driver_name = max(cohort_names, key=lambda n: len(cohort_train[n]))
     driver_size = len(cohort_train[driver_name])
+
+    # class-imbalance correction for aux_clf, matching cnn.py's convention --
+    # computed from TRAIN patients of source (non-target) cohorts only.
+    # Empty (and pos_weight=None, lambda_clf inert) when target_cohort=None --
+    # mirrors stratified MMD's own "None disables it everywhere" behavior;
+    # aux_clf never fires without a designated target_cohort either.
+    source_cohorts = [n for n in cohort_names if target_cohort is not None and n != target_cohort]
+    source_train_patients = [p for n in source_cohorts for p in cohort_train[n]]
+    if source_train_patients:
+        n_pos = sum(p.label for p in source_train_patients)
+        n_neg = len(source_train_patients) - n_pos
+        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+    else:
+        pos_weight = None   # lambda_clf effectively inert -- no source cohort to draw labels from
 
     print(f"cohorts      : {cohort_names}  ({n_pairs} pairs)")
     print(f"target       : {target_cohort!r}  (pairs touching it stay pooled)")
     print(f"stratified   : {stratified_pairs}")
+    print(f"aux clf on   : {source_cohorts}  (lambda_clf={lambda_clf}, pos_weight={pos_weight})")
     print(f"driver cohort: {driver_name!r} ({driver_size} patients) -- others oversampled to match")
     print(f"latent gamma : {latent_gamma_mode}")
     print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}   (image-space, informational only -- not used in the loss)")
@@ -289,8 +338,10 @@ def train_harmonization_multi(
 
         if decoder_freeze_epoch is not None and epoch < decoder_freeze_epoch:
             lambda_mmd_t = 0.0
+            lambda_clf_t = 0.0
         else:
             lambda_mmd_t = lambda_mmd
+            lambda_clf_t = lambda_clf
 
         model.train()
         if decoder_frozen:
@@ -299,6 +350,7 @@ def train_harmonization_multi(
         train_recon      = 0.0
         train_mmd_latent = 0.0
         train_mmd_image  = 0.0
+        train_clf        = 0.0
         n_train_batches = 0
 
         for batch_dict in _cycling_batches(train_loaders):
@@ -306,6 +358,7 @@ def train_harmonization_multi(
 
             zs, x_hats, batch_labels = {}, {}, {}
             recon = torch.zeros((), device=device)
+            clf_loss = torch.zeros((), device=device)
             for name, (vol, label) in batch_dict.items():
                 vol = vol.to(device)
                 x_hat, z = model.reconstruct(name, vol)
@@ -313,7 +366,13 @@ def train_harmonization_multi(
                 zs[name] = z
                 x_hats[name] = x_hat.flatten(start_dim=1)
                 if target_cohort is not None and name != target_cohort:
-                    batch_labels[name] = label.to(device)
+                    label = label.to(device)
+                    batch_labels[name] = label
+                    if lambda_clf_t != 0.0:
+                        logit = model.classify(z)
+                        clf_loss = clf_loss + F.binary_cross_entropy_with_logits(
+                            logit.float(), label.float(), pos_weight=pos_weight
+                        )
 
             if latent_gamma_mode == "fixed" and decoder_frozen and fixed_latent_gammas is None:
                 fixed_latent_gammas = {
@@ -326,7 +385,7 @@ def train_harmonization_multi(
                 zs, fixed_gammas=fixed_latent_gammas,
                 target_cohort=target_cohort, labels=batch_labels,
             )
-            loss = recon + lambda_mmd_t * mmd_latent
+            loss = recon + lambda_mmd_t * mmd_latent + lambda_clf_t * clf_loss
 
             loss.backward()
             optimizer.step()
@@ -337,23 +396,27 @@ def train_harmonization_multi(
             train_recon      += recon.item()
             train_mmd_latent += mmd_latent.item()
             train_mmd_image  += mmd_image.item()
+            train_clf        += clf_loss.item()
             n_train_batches += 1
 
         train_recon      /= max(n_train_batches, 1)
         train_mmd_latent /= max(n_train_batches, 1)
         train_mmd_image  /= max(n_train_batches, 1)
-        train_loss = train_recon + lambda_mmd_t * train_mmd_latent
+        train_clf        /= max(n_train_batches, 1)
+        train_loss = train_recon + lambda_mmd_t * train_mmd_latent + lambda_clf_t * train_clf
 
         model.eval()
         val_recon      = 0.0
         val_mmd_latent = 0.0
         val_mmd_image  = 0.0
+        val_clf        = 0.0
         n_val_batches = 0
 
         with torch.no_grad():
             for batch_dict in _cycling_batches(val_loaders):
                 zs, x_hats, batch_labels = {}, {}, {}
                 recon = torch.zeros((), device=device)
+                clf_loss = torch.zeros((), device=device)
                 for name, (vol, label) in batch_dict.items():
                     vol = vol.to(device)
                     x_hat, z = model.reconstruct(name, vol)
@@ -361,7 +424,13 @@ def train_harmonization_multi(
                     zs[name] = z
                     x_hats[name] = x_hat.flatten(start_dim=1)
                     if target_cohort is not None and name != target_cohort:
-                        batch_labels[name] = label.to(device)
+                        label = label.to(device)
+                        batch_labels[name] = label
+                        if lambda_clf_t != 0.0:
+                            logit = model.classify(z)
+                            clf_loss = clf_loss + F.binary_cross_entropy_with_logits(
+                                logit.float(), label.float(), pos_weight=pos_weight
+                            )
 
                 mmd_latent, _ = pairwise_mmd(
                     zs, fixed_gammas=fixed_latent_gammas,
@@ -372,36 +441,50 @@ def train_harmonization_multi(
                 val_recon      += recon.item()
                 val_mmd_latent += mmd_latent.item()
                 val_mmd_image  += mmd_image.item()
+                val_clf        += clf_loss.item()
                 n_val_batches += 1
 
         val_recon      /= max(n_val_batches, 1)
         val_mmd_latent /= max(n_val_batches, 1)
         val_mmd_image  /= max(n_val_batches, 1)
-        val_loss = val_recon + lambda_mmd_t * val_mmd_latent
+        val_clf        /= max(n_val_batches, 1)
+        val_loss = val_recon + lambda_mmd_t * val_mmd_latent + lambda_clf_t * val_clf
 
         if epoch % 10 == 0 or epoch == n_epochs - 1:
             print(
-                f"epoch {epoch:3d}  lambda_mmd {lambda_mmd_t:.4f}  "
+                f"epoch {epoch:3d}  lambda_mmd {lambda_mmd_t:.4f}  lambda_clf {lambda_clf_t:.4f}  "
                 f"train_loss {train_loss:.5f}  (recon {train_recon:.5f}  "
-                f"mmd_z {train_mmd_latent:.6f}  mmd_img {train_mmd_image:.6f})  "
+                f"mmd_z {train_mmd_latent:.6f}  mmd_img {train_mmd_image:.6f}  clf {train_clf:.5f})  "
                 f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  "
-                f"mmd_z {val_mmd_latent:.6f}  mmd_img {val_mmd_image:.6f})"
+                f"mmd_z {val_mmd_latent:.6f}  mmd_img {val_mmd_image:.6f}  clf {val_clf:.5f})"
             )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            epochs_since_improvement = 0
-            best_state = copy.deepcopy(model.state_dict())
-            if checkpoint_path is not None:
-                torch.save(best_state, checkpoint_path)
-        else:
-            epochs_since_improvement += 1
+        # Early stopping only activates once the decoder is frozen (or from
+        # epoch 0 if decoder_freeze_epoch=None, i.e. no staging at all).
+        # Without this gate, stage 1's val_loss (pure recon, MMD/clf both
+        # forced to 0) can plateau and trigger patience on its own --
+        # stopping training before decoder_freeze_epoch is ever reached,
+        # regardless of what decoder_freeze_epoch is set to. The reset at
+        # freeze time (best_val_loss=inf, epochs_since_improvement=0, a few
+        # lines up) only helps AFTER the freeze happens; it does nothing to
+        # stop stage 1 from independently ending the run first.
+        patience_active = decoder_freeze_epoch is None or decoder_frozen
 
-        if epochs_since_improvement >= patience:
-            print(f"no val_loss improvement for {patience} epochs "
-                  f"(best was {best_val_loss:.5f} at epoch {best_epoch}) -- stopping early")
-            break
+        if patience_active:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_since_improvement = 0
+                best_state = copy.deepcopy(model.state_dict())
+                if checkpoint_path is not None:
+                    torch.save(best_state, checkpoint_path)
+            else:
+                epochs_since_improvement += 1
+
+            if epochs_since_improvement >= patience:
+                print(f"no val_loss improvement for {patience} epochs "
+                      f"(best was {best_val_loss:.5f} at epoch {best_epoch}) -- stopping early")
+                break
 
     print(f"training done -- best val_loss {best_val_loss:.5f} at epoch {best_epoch}")
     if best_state is not None:
