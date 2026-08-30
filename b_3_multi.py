@@ -175,15 +175,25 @@ class VolumeDataset(Dataset):
         return torch.from_numpy(vol).unsqueeze(0), int(patient.label)
 
 
-def _balanced_sampler(patients: list) -> WeightedRandomSampler:
-    # inverse-class-frequency so stratified batches usually have both classes
-    labels = np.array([p.label for p in patients])
-    class_counts = np.bincount(labels)
-    weights = 1.0 / class_counts[labels]
-    return WeightedRandomSampler(weights, num_samples=len(patients), replacement=True)
+def _oversampling_sampler(patients: list, num_samples: int, weighted: bool, replacement: bool) -> WeightedRandomSampler:
+    # weighted=True: inverse-class-frequency, for source cohorts. weighted=False:
+    # uniform, for target -- its labels must never factor into sampling either.
+    # replacement=False (driver, num_samples==len(patients)) draws every patient
+    # exactly once, weights only affecting order; replacement=True (non-driver)
+    # actually oversamples up to num_samples.
+    if weighted:
+        labels = np.array([p.label for p in patients])
+        class_counts = np.bincount(labels)
+        weights = 1.0 / class_counts[labels]
+    else:
+        weights = np.ones(len(patients))
+    return WeightedRandomSampler(weights, num_samples=num_samples, replacement=replacement)
 
 
 def _cycling_batches(loaders: dict[str, DataLoader]):
+    # train loaders are now all oversampled to the same per-epoch length, so
+    # this cycle() degrades to zip() for them; val loaders are still genuinely
+    # different lengths per cohort and rely on real cycling here.
     names = list(loaders.keys())
     lengths = {n: len(loaders[n]) for n in names}
     driver = max(names, key=lambda n: lengths[n])
@@ -216,15 +226,24 @@ def train_harmonization_multi(
     fixed_latent_gammas: dict | None = None
     cohort_names = list(cohort_train.keys())
     n_pairs = len(list(itertools.combinations(cohort_names, 2)))
-    # mirrors the actual gate in the loops below, not just target_cohort alone
     stratified_pairs = [
         (a, b) for a, b in itertools.combinations(cohort_names, 2)
         if target_cohort is not None and target_cohort not in (a, b)
     ]
 
+    # cohort with the most training patients paces the epoch; every other
+    # cohort's train loader oversamples (with replacement) up to that count.
+    # Only source cohorts (not target_cohort) get class-balance weighting --
+    # applied regardless of whether that cohort happens to be the driver,
+    # since the driver can be a source cohort once target_cohort shrinks its
+    # own training set (see the 50/50 split upstream in the sweep script).
+    driver_name = max(cohort_names, key=lambda n: len(cohort_train[n]))
+    driver_size = len(cohort_train[driver_name])
+
     print(f"cohorts      : {cohort_names}  ({n_pairs} pairs)")
     print(f"target       : {target_cohort!r}  (pairs touching it stay pooled)")
     print(f"stratified   : {stratified_pairs}")
+    print(f"driver cohort: {driver_name!r} ({driver_size} patients) -- others oversampled to match")
     print(f"latent gamma : {latent_gamma_mode}")
     print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}   (image-space, informational only -- not used in the loss)")
     print(f"baseline MMD : 0.096446")
@@ -233,13 +252,17 @@ def train_harmonization_multi(
 
     train_loaders = {}
     for name in cohort_names:
-        dataset = VolumeDataset(cohort_train[name])
-        if target_cohort is not None and name != target_cohort:
-            train_loaders[name] = DataLoader(
-                dataset, batch_size=batch_size, sampler=_balanced_sampler(cohort_train[name])
-            )
-        else:
-            train_loaders[name] = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        patients = cohort_train[name]
+        dataset = VolumeDataset(patients)
+        is_source = target_cohort is not None and name != target_cohort
+        is_driver = name == driver_name
+        num_samples = len(patients) if is_driver else driver_size
+        train_loaders[name] = DataLoader(
+            dataset, batch_size=batch_size,
+            sampler=_oversampling_sampler(
+                patients, num_samples=num_samples, weighted=is_source, replacement=not is_driver
+            ),
+        )
     val_loaders = {
         name: DataLoader(VolumeDataset(cohort_val[name]), batch_size=batch_size, shuffle=False)
         for name in cohort_names
@@ -256,12 +279,10 @@ def train_harmonization_multi(
             decoder_frozen = True
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-            # carry over Adam state for encoder params instead of restarting momentum
             old_state = {p: optimizer.state[p] for p in trainable_params if p in optimizer.state}
             optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
             optimizer.state.update(old_state)
 
-            # val_loss scale jumps here (mmd turns on) -- reset best + patience together
             epochs_since_improvement = 0
             best_val_loss = float("inf")
             print(f"epoch {epoch:3d}  -- decoder frozen, mmd turned on (lambda_mmd={lambda_mmd}), optimizing encoder only from here on")
@@ -273,7 +294,7 @@ def train_harmonization_multi(
 
         model.train()
         if decoder_frozen:
-            model.decoder.eval()  # freeze BN running stats too, not just weights
+            model.decoder.eval()
 
         train_recon      = 0.0
         train_mmd_latent = 0.0
@@ -291,9 +312,6 @@ def train_harmonization_multi(
                 recon = recon + F.mse_loss(x_hat, vol)
                 zs[name] = z
                 x_hats[name] = x_hat.flatten(start_dim=1)
-                # guard against target_cohort=None: "name != None" is always
-                # True for a string, so without the None-check every cohort
-                # would land in batch_labels and get stratified regardless
                 if target_cohort is not None and name != target_cohort:
                     batch_labels[name] = label.to(device)
 
@@ -314,7 +332,6 @@ def train_harmonization_multi(
             optimizer.step()
 
             with torch.no_grad():
-                # diagnostic only, always pooled
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
             train_recon      += recon.item()

@@ -20,7 +20,7 @@ DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "b_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(25))
+TORCH_SEEDS    = list(range(10))
 VAL_SPLIT_SEED = 40
 TARGET_HOLDOUT_SEED = 123   # fixed -- same held-out target half across all torch seeds
 N_EPOCHS       = 1000
