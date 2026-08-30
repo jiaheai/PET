@@ -9,15 +9,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 
 DATA_PATH          = "CUBES-Labelled-COHORTS-ZSCORE"
 DOMAIN_SHIFT_GAMMA = 5.3919e-06
 
-# Replace with your actual cohort names -- order doesn't matter for pairwise,
-# every cohort gets compared against every other cohort.
 COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
+
+# Cohort playing unlabeled held-out target this run. Its pairs stay pooled;
+# the other two get class-stratified MMD. None disables stratification.
+TARGET_COHORT = "SWISS"
 
 
 class Encoder3D(nn.Module):
@@ -64,10 +66,6 @@ class Decoder3D(nn.Module):
 
 
 class HarmonizationModel(nn.Module):
-    """One Encoder3D per cohort, one shared decoder -- matches the original
-    2-encoder b.py design (encoder_aug, encoder_pr) generalized to N
-    cohorts, rather than a single encoder shared across all of them."""
-
     def __init__(self, cohort_names: list[str], latent_dim: int = 64):
         super().__init__()
         self.cohort_names = list(cohort_names)
@@ -83,15 +81,11 @@ class HarmonizationModel(nn.Module):
         return x_hat, z
 
     def set_decoder_trainable(self, trainable: bool) -> None:
-        """Freeze/unfreeze the shared decoder (used for stage-2 encoder-only training)."""
         for p in self.decoder.parameters():
             p.requires_grad = trainable
 
 
-# -- MMD loss ------------------------------------------------------------
-
 def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
-    """RBF-kernel MMD. x, y: (N, D) and (M, D) -- gamma must match their scale."""
     def rbf(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.exp(-gamma * torch.cdist(a, b).pow(2))
 
@@ -101,10 +95,27 @@ def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
     return kxx + kyy - 2 * kxy
 
 
+def compute_mmd_stratified(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    x_labels: torch.Tensor,
+    y_labels: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    # source-source only -- never call this on a pair touching an unlabeled target
+    common_classes = sorted(set(x_labels.tolist()) & set(y_labels.tolist()))
+    if not common_classes:
+        return compute_mmd(x, y, gamma)  # no shared class this batch -- fall back to pooled
+
+    terms = []
+    for c in common_classes:
+        xc = x[x_labels == c]
+        yc = y[y_labels == c]
+        terms.append(compute_mmd(xc, yc, gamma))
+    return torch.stack(terms).mean()
+
+
 def median_heuristic_gamma(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
-    """Median-heuristic RBF bandwidth: gamma = 1 / (2 * median(pairwise sq dist)).
-    Computed under no_grad -- chooses a bandwidth constant, not differentiated through.
-    """
     pooled = torch.cat([x, y], dim=0)
     with torch.no_grad():
         d2 = torch.cdist(pooled, pooled).pow(2)
@@ -117,38 +128,17 @@ def median_heuristic_gamma(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) 
     return gamma.item()
 
 
-def compute_mmd_stratified(*args, **kwargs):
-    raise NotImplementedError(
-        "compute_mmd_stratified was removed: it required target-cohort labels, "
-        "which aren't available at deployment time for a real unlabeled target "
-        "cohort -- and since this sweep rotates which cohort plays target, no "
-        "single cohort can be assumed safe to stratify. Use compute_mmd(x, y, "
-        "gamma) instead -- pooled, no labels needed."
-    )
-
-
 def pairwise_mmd(
     zs: dict[str, torch.Tensor],
     gamma_fn=median_heuristic_gamma,
     fixed_gamma: float | None = None,
     fixed_gammas: dict[tuple[str, str], float] | None = None,
+    target_cohort: str | None = None,
+    labels: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[tuple[str, str], float]]:
-    """Averages POOLED MMD over every cohort pair -- no labels used anywhere.
-    Returns the averaged scalar (for the loss) and a dict of each pair's
-    individual value (for logging).
-
-    fixed_gamma overrides the per-pair adaptive gamma with ONE scalar
-    applied to every pair (used for the image-space logging variant,
-    which needs DOMAIN_SHIFT_GAMMA for comparability with domain_shift.py
-    rather than an adaptive one).
-
-    fixed_gammas overrides with a PER-PAIR dict instead of one shared
-    scalar -- used for the latent-space "gamma frozen at stage-2 start"
-    comparison mode, since different cohort pairs can genuinely sit at
-    different latent-space scales (unlike DOMAIN_SHIFT_GAMMA's single
-    fixed image-space scale, there's no single "correct" fixed latent
-    scale shared across all pairs).
-    """
+    # pairs touching target_cohort stay pooled; source-source pairs stratify
+    # when labels are present for both sides. Caller must omit target's
+    # labels -- this function only enforces the target_cohort side of it.
     names = list(zs.keys())
     terms = {}
     for a, b in itertools.combinations(names, 2):
@@ -158,13 +148,19 @@ def pairwise_mmd(
             gamma = fixed_gamma
         else:
             gamma = gamma_fn(zs[a], zs[b])
-        terms[(a, b)] = compute_mmd(zs[a], zs[b], gamma=gamma)
+
+        touches_target = target_cohort is not None and target_cohort in (a, b)
+        has_labels = labels is not None and a in labels and b in labels
+
+        if not touches_target and has_labels:
+            terms[(a, b)] = compute_mmd_stratified(zs[a], zs[b], labels[a], labels[b], gamma=gamma)
+        else:
+            terms[(a, b)] = compute_mmd(zs[a], zs[b], gamma=gamma)
+
     avg = torch.stack(list(terms.values())).mean()
     terms_logged = {k: v.item() for k, v in terms.items()}
     return avg, terms_logged
 
-
-# -- dataset ------------------------------------------------------------
 
 class VolumeDataset(Dataset):
     def __init__(self, patients: list):
@@ -173,17 +169,21 @@ class VolumeDataset(Dataset):
     def __len__(self) -> int:
         return len(self.patients)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        vol = self.patients[idx].pet_masked.astype("float32")
-        return torch.from_numpy(vol).unsqueeze(0)   # (1, 32, 32, 32)
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        patient = self.patients[idx]
+        vol = patient.pet_masked.astype("float32")
+        return torch.from_numpy(vol).unsqueeze(0), int(patient.label)
+
+
+def _balanced_sampler(patients: list) -> WeightedRandomSampler:
+    # inverse-class-frequency so stratified batches usually have both classes
+    labels = np.array([p.label for p in patients])
+    class_counts = np.bincount(labels)
+    weights = 1.0 / class_counts[labels]
+    return WeightedRandomSampler(weights, num_samples=len(patients), replacement=True)
 
 
 def _cycling_batches(loaders: dict[str, DataLoader]):
-    """Yields one dict[cohort_name] = vol_batch per step, iterating for as
-    many steps as the longest loader has, cycling the shorter ones --
-    generalization of the 2-cohort zip/cycle trick to N cohorts of
-    different sizes.
-    """
     names = list(loaders.keys())
     lengths = {n: len(loaders[n]) for n in names}
     driver = max(names, key=lambda n: lengths[n])
@@ -191,8 +191,6 @@ def _cycling_batches(loaders: dict[str, DataLoader]):
     for batches in zip(*iters):
         yield dict(zip(names, batches))
 
-
-# -- training loop ------------------------------------------------------------
 
 def train_harmonization_multi(
     model: HarmonizationModel,
@@ -204,70 +202,44 @@ def train_harmonization_multi(
     lambda_mmd: float = 1.0,
     decoder_freeze_epoch: int | None = None,
     latent_gamma_mode: str = "adaptive",
+    target_cohort: str | None = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     patience: int = 100,
     checkpoint_path: str | None = "best_harmonization_multi.pt",
 ) -> HarmonizationModel:
-    """
-    cohort_train / cohort_val : dict mapping cohort name -> list of patients.
-                         Any number of cohorts (2+). Pairwise MMD is computed
-                         over every cohort pair and averaged, POOLED -- no
-                         labels used anywhere in the loss (labels are used
-                         only downstream, for classifier fitting/eval in
-                         the sweep script, never for harmonization). O(N^2)
-                         pairs, so this gets expensive with many cohorts
-                         (10 cohorts = 45 pairs/step); fine for a handful.
-    decoder_freeze_epoch : same two-stage pattern as the 2-cohort version --
-                         stage 1 (epoch < decoder_freeze_epoch) trains
-                         encoder+decoder with mmd excluded from the loss
-                         entirely (lambda_mmd_t=0), pure reconstruction.
-                         At decoder_freeze_epoch the decoder freezes (weights
-                         AND BatchNorm running stats -- see model.decoder.eval()
-                         below) and mmd turns on at lambda_mmd; only the
-                         encoders adapt from then on. None disables this
-                         (mmd on the whole run).
-    latent_gamma_mode : "adaptive" (default) recomputes each pair's
-                         median-heuristic gamma fresh every batch -- the
-                         bandwidth tracks wherever the encoders' latent
-                         scale currently sits, which is a moving target
-                         for the optimizer to align against. "fixed"
-                         computes each pair's gamma ONCE, from the first
-                         training batch at decoder_freeze_epoch (i.e. once
-                         the encoders are already stage-1-trained, not
-                         from random-init noise), then holds that same
-                         per-pair value for the rest of training -- a
-                         static target instead of a moving one. This is
-                         NOT the same as using DOMAIN_SHIFT_GAMMA: that
-                         constant is calibrated for image-space voxel
-                         scale and would be nonsense-scaled for latent
-                         codes; "fixed" here still uses real, data-derived
-                         per-pair bandwidths, just computed once instead
-                         of every batch. Only meaningful when
-                         decoder_freeze_epoch is set -- stage 1 has
-                         lambda_mmd_t=0 regardless, so gamma choice there
-                         never affects gradients either way.
-    """
     if latent_gamma_mode not in ("adaptive", "fixed"):
         raise ValueError(f"latent_gamma_mode must be 'adaptive' or 'fixed', got {latent_gamma_mode!r}")
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     decoder_frozen = False
-    fixed_latent_gammas: dict | None = None   # populated once, at stage-2 start, if mode=="fixed"
+    fixed_latent_gammas: dict | None = None
     cohort_names = list(cohort_train.keys())
     n_pairs = len(list(itertools.combinations(cohort_names, 2)))
+    # mirrors the actual gate in the loops below, not just target_cohort alone
+    stratified_pairs = [
+        (a, b) for a, b in itertools.combinations(cohort_names, 2)
+        if target_cohort is not None and target_cohort not in (a, b)
+    ]
 
-    print(f"cohorts      : {cohort_names}  ({n_pairs} pairs, all pooled -- no labels used)")
+    print(f"cohorts      : {cohort_names}  ({n_pairs} pairs)")
+    print(f"target       : {target_cohort!r}  (pairs touching it stay pooled)")
+    print(f"stratified   : {stratified_pairs}")
     print(f"latent gamma : {latent_gamma_mode}")
     print(f"gamma        : {DOMAIN_SHIFT_GAMMA:.4e}   (image-space, informational only -- not used in the loss)")
     print(f"baseline MMD : 0.096446")
     if decoder_freeze_epoch is not None:
         print(f"decoder freeze at epoch {decoder_freeze_epoch} (stage-2 encoder-only training)")
 
-    train_loaders = {
-        name: DataLoader(VolumeDataset(cohort_train[name]), batch_size=batch_size, shuffle=True)
-        for name in cohort_names
-    }
+    train_loaders = {}
+    for name in cohort_names:
+        dataset = VolumeDataset(cohort_train[name])
+        if target_cohort is not None and name != target_cohort:
+            train_loaders[name] = DataLoader(
+                dataset, batch_size=batch_size, sampler=_balanced_sampler(cohort_train[name])
+            )
+        else:
+            train_loaders[name] = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     val_loaders = {
         name: DataLoader(VolumeDataset(cohort_val[name]), batch_size=batch_size, shuffle=False)
         for name in cohort_names
@@ -284,19 +256,12 @@ def train_harmonization_multi(
             decoder_frozen = True
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-            # Rebuild the optimizer around the smaller param set, but carry
-            # over each encoder param's existing Adam state (exp_avg,
-            # exp_avg_sq) instead of restarting momentum at zero right as
-            # lambda_mmd turns on -- params are the same tensor objects
-            # (freezing doesn't recreate them), so this reattaches cleanly.
+            # carry over Adam state for encoder params instead of restarting momentum
             old_state = {p: optimizer.state[p] for p in trainable_params if p in optimizer.state}
             optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
             optimizer.state.update(old_state)
 
-            # val_loss's scale jumps here (mmd term switches on): reset both
-            # the patience counter AND best_val_loss -- see 2-cohort version
-            # for why keeping only the counter reset silently pins the
-            # returned model to a pre-freeze, pre-harmonization checkpoint.
+            # val_loss scale jumps here (mmd turns on) -- reset best + patience together
             epochs_since_improvement = 0
             best_val_loss = float("inf")
             print(f"epoch {epoch:3d}  -- decoder frozen, mmd turned on (lambda_mmd={lambda_mmd}), optimizing encoder only from here on")
@@ -306,15 +271,9 @@ def train_harmonization_multi(
         else:
             lambda_mmd_t = lambda_mmd
 
-        # -- training --------------------------------------------------
         model.train()
         if decoder_frozen:
-            # requires_grad=False alone doesn't stop BatchNorm running-stat
-            # updates -- model.train() above puts the decoder's BN layers
-            # back in train mode every epoch. eval() here keeps the decoder
-            # a genuinely fixed function during stage 2, not just fixed
-            # weights with still-drifting normalization.
-            model.decoder.eval()
+            model.decoder.eval()  # freeze BN running stats too, not just weights
 
         train_recon      = 0.0
         train_mmd_latent = 0.0
@@ -324,20 +283,20 @@ def train_harmonization_multi(
         for batch_dict in _cycling_batches(train_loaders):
             optimizer.zero_grad()
 
-            zs, x_hats, xs = {}, {}, {}
+            zs, x_hats, batch_labels = {}, {}, {}
             recon = torch.zeros((), device=device)
-            for name, vol in batch_dict.items():
+            for name, (vol, label) in batch_dict.items():
                 vol = vol.to(device)
                 x_hat, z = model.reconstruct(name, vol)
                 recon = recon + F.mse_loss(x_hat, vol)
                 zs[name] = z
-                x_hats[name] = x_hat.flatten(start_dim=1)   # flatten for MMD's cdist
-                xs[name] = vol
+                x_hats[name] = x_hat.flatten(start_dim=1)
+                # guard against target_cohort=None: "name != None" is always
+                # True for a string, so without the None-check every cohort
+                # would land in batch_labels and get stratified regardless
+                if target_cohort is not None and name != target_cohort:
+                    batch_labels[name] = label.to(device)
 
-            # "fixed" mode: capture each pair's gamma ONCE, from the first
-            # training batch at/after decoder_freeze_epoch (encoders are
-            # already stage-1-trained by then, not random-init noise), then
-            # reuse that same per-pair value for the rest of training.
             if latent_gamma_mode == "fixed" and decoder_frozen and fixed_latent_gammas is None:
                 fixed_latent_gammas = {
                     pair: median_heuristic_gamma(zs[pair[0]], zs[pair[1]])
@@ -345,18 +304,19 @@ def train_harmonization_multi(
                 }
                 print(f"epoch {epoch:3d}  -- latent gamma frozen at stage-2 start: {fixed_latent_gammas}")
 
-            mmd_latent, _ = pairwise_mmd(zs, fixed_gammas=fixed_latent_gammas)
+            mmd_latent, _ = pairwise_mmd(
+                zs, fixed_gammas=fixed_latent_gammas,
+                target_cohort=target_cohort, labels=batch_labels,
+            )
             loss = recon + lambda_mmd_t * mmd_latent
 
             loss.backward()
             optimizer.step()
 
             with torch.no_grad():
+                # diagnostic only, always pooled
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
-            # recon is a sum of already batch-mean-reduced F.mse_loss terms --
-            # a per-batch quantity, same footing as mmd_latent/mmd_image --
-            # so it accumulates and averages over n_train_batches like they do.
             train_recon      += recon.item()
             train_mmd_latent += mmd_latent.item()
             train_mmd_image  += mmd_image.item()
@@ -367,7 +327,6 @@ def train_harmonization_multi(
         train_mmd_image  /= max(n_train_batches, 1)
         train_loss = train_recon + lambda_mmd_t * train_mmd_latent
 
-        # -- validation --------------------------------------------------
         model.eval()
         val_recon      = 0.0
         val_mmd_latent = 0.0
@@ -376,16 +335,21 @@ def train_harmonization_multi(
 
         with torch.no_grad():
             for batch_dict in _cycling_batches(val_loaders):
-                zs, x_hats = {}, {}
+                zs, x_hats, batch_labels = {}, {}, {}
                 recon = torch.zeros((), device=device)
-                for name, vol in batch_dict.items():
+                for name, (vol, label) in batch_dict.items():
                     vol = vol.to(device)
                     x_hat, z = model.reconstruct(name, vol)
                     recon = recon + F.mse_loss(x_hat, vol)
                     zs[name] = z
                     x_hats[name] = x_hat.flatten(start_dim=1)
+                    if target_cohort is not None and name != target_cohort:
+                        batch_labels[name] = label.to(device)
 
-                mmd_latent, _ = pairwise_mmd(zs, fixed_gammas=fixed_latent_gammas)
+                mmd_latent, _ = pairwise_mmd(
+                    zs, fixed_gammas=fixed_latent_gammas,
+                    target_cohort=target_cohort, labels=batch_labels,
+                )
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
                 val_recon      += recon.item()
@@ -428,8 +392,6 @@ def train_harmonization_multi(
     return model
 
 
-# -- reconstruction saving ------------------------------------------------------
-
 def save_harmonized_reconstructions(
     model: HarmonizationModel,
     patients: list,
@@ -461,7 +423,6 @@ def save_harmonized_reconstructions(
     print(f"saved {len(patients)} harmonized reconstructions to {out_root / cohort}")
 
 
-# -- entry point ------------------------------------------------------------
 if __name__ == "__main__":
     from nifti_loader import load_all_cohorts
     from sklearn.model_selection import train_test_split
@@ -486,6 +447,8 @@ if __name__ == "__main__":
     torch.manual_seed(41)
     model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
 
+    checkpoint_name = f"best_harmonization_multi_target-{TARGET_COHORT or 'none'}.pt"
+
     model = train_harmonization_multi(
         model,
         cohort_train=cohort_train,
@@ -493,7 +456,8 @@ if __name__ == "__main__":
         n_epochs=1000,
         lambda_mmd=1,
         decoder_freeze_epoch=100,
-        checkpoint_path=str(models_dir / "best_harmonization_multi.pt"),
+        target_cohort=TARGET_COHORT,
+        checkpoint_path=str(models_dir / checkpoint_name),
     )
 
     for name in COHORT_NAMES:
