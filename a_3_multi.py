@@ -194,7 +194,7 @@ def train_harmonization(
     lambda_mmd: float = 1.0,
     decoder_freeze_epoch: int | None = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    patience: int = 200,
+    patience: int = 50,
     checkpoint_path: str | None = "best_harmonization_shared.pt",
 ) -> HarmonizationModel:
     """

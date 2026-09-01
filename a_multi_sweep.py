@@ -22,6 +22,13 @@ only the call site's kwargs below.
 Same 50/50 held-out split as b_sweep_multi.py / cnn_sweep_multi.py, using
 the SAME TARGET_HOLDOUT_SEED -- so target_heldout is identical across all
 three approaches' sweeps, required for a valid cross-approach comparison.
+
+TORCH_SEEDS is also matched to b_sweep_multi.py's count (10, not 5) --
+cross-approach comparison needs equally powered summary stats on both
+sides, not just matched held-out patients. Resume logic below mirrors
+b_sweep_multi.py's for the same reason both scripts need it: 10 seeds x
+1000 epochs is long enough that losing a partial run to a crash or a
+kill is a real cost, not a hypothetical one.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from a import HarmonizationModel, train_harmonization
+from a_3_multi import HarmonizationModel, train_harmonization
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
@@ -47,13 +54,14 @@ DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "a_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(5))
+TORCH_SEEDS    = list(range(5))    # matched to b_sweep_multi.py -- see module docstring
 VAL_SPLIT_SEED = 40             # fixed -- keeps the same val patients across all torch seeds
 TARGET_HOLDOUT_SEED = 123       # fixed -- SAME value as b_sweep_multi.py / cnn_sweep_multi.py,
                                  # so target_heldout is identical across every approach's sweep
-LAMBDA_MMD     = 1
-DECODER_FREEZE_EPOCH = 100
+LAMBDA_MMD     = 100
+DECODER_FREEZE_EPOCH = 50
 N_EPOCHS       = 1000
+PATIENCE = 20
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +76,10 @@ def parse_args() -> argparse.Namespace:
         "--results-path", default=DEFAULT_RESULTS_PATH,
         help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}).",
     )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Wipe --results-path and rerun every seed from scratch. Default: resume.",
+    )
     return parser.parse_args()
 
 
@@ -81,6 +93,29 @@ def append_summary(s: dict, results_path: Path) -> None:
     s = {"record_type": "summary", **s}
     with open(results_path, "a") as f:
         f.write(json.dumps(s) + "\n")
+
+
+def load_existing_results(results_path: Path) -> list[dict]:
+    if not results_path.exists():
+        return []
+    runs = []
+    with open(results_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.pop("record_type", None) == "run":
+                runs.append(rec)
+    return runs
+
+
+def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
+    # a seed only counts as complete if every cohort has a run record for it
+    by_seed: dict[int, set[str]] = {}
+    for r in runs:
+        by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
+    return {seed for seed, cohorts in by_seed.items() if cohorts == set(cohort_names)}
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
@@ -164,9 +199,13 @@ def train_model_once(
         known_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
         stratify=[p.label for p in known_patients],
     )
+    # target's split is NOT label-stratified -- a real deployment-time
+    # unlabeled target cohort has no labels to stratify by, so
+    # stratifying here would be testing under friendlier conditions than
+    # the model will actually see. known_patients keeps stratification
+    # since its labels genuinely drive the classifier fit later.
     train_target_harm, val_target_harm = train_test_split(
         target_harmonization, test_size=0.2, random_state=VAL_SPLIT_SEED,
-        stratify=[p.label for p in target_harmonization],
     )
 
     torch.manual_seed(torch_seed)
@@ -179,6 +218,7 @@ def train_model_once(
         lambda_mmd=LAMBDA_MMD,
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
         checkpoint_path=None,
+        patience=PATIENCE,
     )
     return model, all_cohorts, target_harmonization, target_heldout
 
@@ -273,12 +313,29 @@ if __name__ == "__main__":
         if name not in all_cohorts:
             raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
 
-    # Always run fresh -- no resume/skip logic. Truncate results_path up
-    # front so this run's results aren't mixed with any prior run's.
-    results_path.write_text("")
+    existing_runs = [] if args.fresh else load_existing_results(results_path)
+    done_seeds = complete_seeds(existing_runs, COHORT_NAMES) & set(TORCH_SEEDS)
+    results = [r for r in existing_runs if r["torch_seed"] in done_seeds]
 
-    results = []
-    for torch_seed in TORCH_SEEDS:
+    discarded_seeds = {r["torch_seed"] for r in existing_runs} - done_seeds
+    if discarded_seeds:
+        print(f"discarding incomplete/outdated seed(s) found in {results_path}: "
+              f"{sorted(discarded_seeds)} (redoing from scratch)")
+
+    results_path.write_text("")
+    for r in results:
+        append_result(r, results_path)
+
+    seeds_to_run = [s for s in TORCH_SEEDS if s not in done_seeds]
+    if args.fresh:
+        print(f"--fresh: running all {len(seeds_to_run)} seeds: {seeds_to_run}")
+    elif done_seeds:
+        print(f"resuming: {len(done_seeds)} seed(s) already complete {sorted(done_seeds)}, "
+              f"running {len(seeds_to_run)} more: {seeds_to_run}")
+    else:
+        print(f"no usable prior results -- running all {len(seeds_to_run)} seeds: {seeds_to_run}")
+
+    for torch_seed in seeds_to_run:
         for target_cohort in COHORT_NAMES:
             print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
                   f"(50% of {target_cohort} in training [unsupervised], 50% fully held out)\n{'='*60}")

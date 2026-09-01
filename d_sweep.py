@@ -1,3 +1,17 @@
+"""
+Leave-one-cohort-out sweep using the alternating block-coordinate
+fine-tune (harmonization_stratified.alternating_classifier_finetune)
+instead of aux_clf trained jointly by SGD the whole time.
+
+Per (seed, target_cohort): train stages 1-2 (train_harmonization_multi,
+lambda_clf=0 -- pure recon+MMD, no classification signal yet), then hand
+the harmonized model to alternating_classifier_finetune, which alternates
+between fitting a full sklearn LogisticRegression on the current z and
+training the encoders against that frozen fit (MMD still active every
+round). After that returns, model.aux_clf already IS the classifier to
+use -- evaluate_target reads it directly, no separate downstream refit.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -6,38 +20,45 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
-from b_3_multi import HarmonizationModel, train_harmonization_multi
+from d_3 import (
+    HarmonizationModel,
+    train_harmonization_multi,
+    alternating_classifier_finetune,
+)
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct
 
-DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
-DEFAULT_RESULTS_PATH = "b_sweep_multi_results.jsonl"
+DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS-ZSCORE"
+DEFAULT_RESULTS_PATH = "alt_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(5))
+TORCH_SEEDS    = list(range(25))
 VAL_SPLIT_SEED = 40
-TARGET_HOLDOUT_SEED = 123   # fixed -- same held-out target half across all torch seeds
+TARGET_HOLDOUT_SEED = 123
+
+# -- stage 1-2 (harmonization) settings -------------------------------------
 N_EPOCHS       = 1000
 LAMBDA_MMD     = 100
-LAMBDA_CLF     = 1
-TARGET_PAIR_WEIGHT = 1.0   # only used when PAIR_WEIGHTING="static"
-PAIR_WEIGHTING = "adaptive"  # "static" or "adaptive" -- see train_harmonization_multi's docstring
-WEIGHTING_EMA_BETA = 0.9
-WEIGHTING_TEMPERATURE = 0.5
 LATENT_GAMMA_MODE = "adaptive"
 DECODER_FREEZE_EPOCH = 50
-PATIENCE = 50
+PATIENCE = 50   # only counts post-freeze, see train_harmonization_multi's patience_active gate
+
+# -- alternating fine-tune settings ------------------------------------------
+ALT_N_ROUNDS        = 5
+ALT_EPOCHS_PER_ROUND = 10
+ALT_LAMBDA_MMD       = 100   # MMD weight during alternating rounds -- kept equal to stage-2's
+                              # LAMBDA_MMD by default; change independently if you want to test
+                              # a different alignment strength for the fine-tune phase specifically
+ALT_LR               = 1e-4
+ALT_FINAL_FIT_ONLY   = True
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Leave-one-cohort-out sweep across all cohort combinations and torch seeds"
+        description="Leave-one-cohort-out sweep, alternating classifier fine-tune"
     )
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH)
     parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
@@ -76,7 +97,6 @@ def load_existing_results(results_path: Path) -> list[dict]:
 
 
 def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
-    # a seed only counts as complete if every cohort has a run record for it
     by_seed: dict[int, set[str]] = {}
     for r in runs:
         by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
@@ -84,7 +104,6 @@ def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
-    # harmonization half enters training; held-out half is never touched until final eval
     harmonization_half, heldout_half = train_test_split(
         patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
         stratify=[p.label for p in patients],
@@ -92,14 +111,20 @@ def split_target_cohort(patients: list) -> tuple[list, list]:
     return harmonization_half, heldout_half
 
 
-def encode_patients(
+def predict_probs(
     model: HarmonizationModel,
     patients: list,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Same as b_sweep_multi.py's predict_probs -- reads straight from
+    model.aux_clf. After alternating_classifier_finetune, aux_clf holds a
+    real, fully-converged sklearn fit (folded into linear-layer form), not
+    a jointly-SGD-trained proxy -- so this is exactly the classifier that
+    was used throughout the fine-tune, not a stand-in for it.
+    """
     model = model.to(device)
     model.eval()
-    zs, ys = [], []
+    probs, ys = [], []
     with torch.no_grad():
         for patient in patients:
             vol = (
@@ -107,18 +132,17 @@ def encode_patients(
                 .unsqueeze(0).unsqueeze(0)
                 .to(device)
             )
-            z = model.encode(patient.cohort, vol).squeeze(0).cpu().numpy()
-            zs.append(z)
+            z = model.encode(patient.cohort, vol)
+            logit = model.classify(z)
+            probs.append(torch.sigmoid(logit).item())
             ys.append(patient.label)
-    return np.stack(zs), np.array(ys)
+    return np.array(probs), np.array(ys)
 
 
-def eval_set(model, clf, plist, prob_override=None) -> dict | None:
-    if not plist:
+def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict | None:
+    if len(y) == 0:
         return None
-    Z, y = encode_patients(model, plist)
-    y_prob = clf.predict_proba(Z)[:, 1] if prob_override is None else prob_override
-    y_pred = (y_prob >= 0.5).astype(int)
+    y_pred = (y_prob >= threshold).astype(int)
     acc = accuracy_score(y, y_pred)
     auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
     tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
@@ -141,39 +165,45 @@ def train_model_once(
     cohort_train, cohort_val, cohort_all = {}, {}, {}
     for name in COHORT_NAMES:
         cohort_all[name] = all_cohorts[name]
-        is_target = name == target_cohort
-        patients_for_training = target_harmonization if is_target else all_cohorts[name]
+        patients_for_training = target_harmonization if name == target_cohort else all_cohorts[name]
 
-        # target's split is NOT label-stratified -- a real deployment-time
-        # unlabeled target cohort has no labels to stratify by, so
-        # stratifying here would be testing under friendlier conditions
-        # than the model will actually see. Known (source) cohorts keep
-        # stratification since their labels genuinely drive lambda_clf.
         train_p, val_p = train_test_split(
             patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
-            stratify=None if is_target else [p.label for p in patients_for_training],
+            stratify=[p.label for p in patients_for_training],
         )
         cohort_train[name] = train_p
         cohort_val[name] = val_p
 
     torch.manual_seed(torch_seed)
     model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
+
+    # -- stage 1-2: pure recon+MMD, no classification signal yet ------------
     model = train_harmonization_multi(
         model,
         cohort_train=cohort_train, cohort_val=cohort_val,
         n_epochs=N_EPOCHS,
         lambda_mmd=LAMBDA_MMD,
-        lambda_clf=LAMBDA_CLF,
+        lambda_clf=0.0,
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
         latent_gamma_mode=LATENT_GAMMA_MODE,
         target_cohort=target_cohort,
-        target_pair_weight=TARGET_PAIR_WEIGHT,
-        pair_weighting=PAIR_WEIGHTING,
-        weighting_ema_beta=WEIGHTING_EMA_BETA,
-        weighting_temperature=WEIGHTING_TEMPERATURE,
         checkpoint_path=None,
         patience=PATIENCE,
     )
+
+    # -- alternating fine-tune: fit-classifier / train-encoders, repeat -----
+    model = alternating_classifier_finetune(
+        model,
+        cohort_train=cohort_train, cohort_val=cohort_val,
+        target_cohort=target_cohort,
+        n_rounds=ALT_N_ROUNDS,
+        epochs_per_round=ALT_EPOCHS_PER_ROUND,
+        lambda_mmd=ALT_LAMBDA_MMD,
+        lr=ALT_LR,
+        checkpoint_path=None,
+        final_fit_only=ALT_FINAL_FIT_ONLY,
+    )
+
     return model, cohort_all, target_harmonization, target_heldout
 
 
@@ -186,30 +216,22 @@ def evaluate_target(
     target_heldout: list,
 ) -> dict:
     known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
-
     known_patients = [p for name in known_cohorts for p in cohort_all[name]]
-    Z_known, y_known = encode_patients(model, known_patients)
-    clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
-    clf.fit(Z_known, y_known)
 
-    # held-out half: untouched by harmonization training and by clf.fit until here
-    target_patients = target_heldout
+    prob_known, y_known = predict_probs(model, known_patients)
+    prob_harm, y_harm = predict_probs(model, target_harmonization)
+    prob_target, y_target = predict_probs(model, target_heldout)
 
-    # z-score correction references the pooled known cohorts, since that's
-    # what clf's 0.5 threshold was calibrated against
-    prob_known = clf.predict_proba(Z_known)[:, 1]
-    Z_target, _ = encode_patients(model, target_patients)
-    prob_target = clf.predict_proba(Z_target)[:, 1]
     prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
 
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
         "known_cohorts": known_cohorts,
-        "known_cohort_insample": eval_set(model, clf, known_patients),
-        "target_cohort_harmonization_half": eval_set(model, clf, target_harmonization),
-        "target_cohort_raw": eval_set(model, clf, target_patients),
-        "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),
+        "known_cohort_insample": eval_on(y_known, prob_known),
+        "target_cohort_harmonization_half": eval_on(y_harm, prob_harm),
+        "target_cohort_raw": eval_on(y_target, prob_target),
+        "target_cohort_corrected": eval_on(y_target, prob_target_corrected),
     }
 
 
@@ -257,6 +279,8 @@ if __name__ == "__main__":
     print(f"data path    : {data_path}")
     print(f"results path : {results_path}")
     print(f"cohorts      : {COHORT_NAMES}")
+    print(f"alt fine-tune: {ALT_N_ROUNDS} rounds x {ALT_EPOCHS_PER_ROUND} epochs  "
+          f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}  final_fit_only={ALT_FINAL_FIT_ONLY}")
 
     all_cohorts = load_all_cohorts(data_path)
     for name in COHORT_NAMES:
