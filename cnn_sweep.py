@@ -36,7 +36,7 @@ DEFAULT_RESULTS_PATH = "cnn_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
 LATENT_DIM     = 16               # fixed -- 16-dim beat 64-dim in the earlier 5-seed 2-cohort comparison
-TORCH_SEEDS    = list(range(25))   # matches the seed count used by the harmonization sweeps this session
+TORCH_SEEDS    = list(range(50))   # matches the seed count used by the harmonization sweeps this session
 VAL_SPLIT_SEED = 40                # fixed -- same known-cohort train/val split across all runs
 TARGET_HOLDOUT_SEED = 123          # fixed -- same held-out half of target across all torch seeds,
                                     # and the SAME patients the harmonization sweeps hold out --

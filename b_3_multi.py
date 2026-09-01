@@ -84,9 +84,7 @@ class HarmonizationModel(nn.Module):
     def classify(self, z: torch.Tensor) -> torch.Tensor:
         # side-by-side supervision, not sequential fine-tuning: this head
         # trains ON THE SAME z, in the SAME backward() call, as recon/MMD --
-        # never after them in a separate phase. That's what keeps alignment
-        # pressure (MMD) and separability pressure (this) both active at
-        # once, so the encoder can't satisfy one by sacrificing the other.
+        # never after them in a separate phase.
         return self.aux_clf(z).squeeze(-1)
 
     def set_decoder_trainable(self, trainable: bool) -> None:
@@ -94,12 +92,29 @@ class HarmonizationModel(nn.Module):
             p.requires_grad = trainable
 
 
-def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
+def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float, unbiased: bool = False) -> torch.Tensor:
+    """unbiased=True uses the U-statistic (excludes self-comparisons from the
+    kxx/kyy means) instead of the V-statistic. The V-statistic's diagonal
+    terms are always exactly 1 (self-kernel), which biases kxx/kyy upward by
+    O(1/n) -- negligible at large n, but severe at the small per-class n the
+    stratified path can hit (see compute_mmd_stratified). Falls back to
+    biased automatically if n<2 on either side -- a U-statistic needs at
+    least 2 samples to form an off-diagonal average at all.
+    """
     def rbf(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.exp(-gamma * torch.cdist(a, b).pow(2))
 
-    kxx = rbf(x, x).mean()
-    kyy = rbf(y, y).mean()
+    n, m = x.size(0), y.size(0)
+    use_unbiased = unbiased and n >= 2 and m >= 2
+
+    if use_unbiased:
+        kxx_full, kyy_full = rbf(x, x), rbf(y, y)
+        kxx = (kxx_full.sum() - kxx_full.diagonal().sum()) / (n * (n - 1))
+        kyy = (kyy_full.sum() - kyy_full.diagonal().sum()) / (m * (m - 1))
+    else:
+        kxx = rbf(x, x).mean()
+        kyy = rbf(y, y).mean()
+
     kxy = rbf(x, y).mean()
     return kxx + kyy - 2 * kxy
 
@@ -110,8 +125,16 @@ def compute_mmd_stratified(
     x_labels: torch.Tensor,
     y_labels: torch.Tensor,
     gamma: float,
+    out_stats: dict | None = None,
 ) -> torch.Tensor:
-    # source-source only -- never call this on a pair touching an unlabeled target
+    # source-source only -- never call this on a pair touching an unlabeled target.
+    # Always requests the unbiased U-statistic per class (see compute_mmd) --
+    # splitting an already-small batch by class routinely lands at n=1-3 per
+    # class, where the biased V-statistic overestimates MMD badly (empirically
+    # ~1.5 at n=1 for two IDENTICAL distributions, vs the correct ~0).
+    # out_stats, if given, accumulates diagnostics: 'per_class_n' (list of
+    # min(n,m) seen per class this call) and 'n_below_2' (count of classes
+    # that had to fall back to biased because n<2 on one side).
     common_classes = sorted(set(x_labels.tolist()) & set(y_labels.tolist()))
     if not common_classes:
         return compute_mmd(x, y, gamma)  # no shared class this batch -- fall back to pooled
@@ -120,7 +143,12 @@ def compute_mmd_stratified(
     for c in common_classes:
         xc = x[x_labels == c]
         yc = y[y_labels == c]
-        terms.append(compute_mmd(xc, yc, gamma))
+        n, m = xc.size(0), yc.size(0)
+        if out_stats is not None:
+            out_stats.setdefault("per_class_n", []).append(min(n, m))
+            if n < 2 or m < 2:
+                out_stats["n_below_2"] = out_stats.get("n_below_2", 0) + 1
+        terms.append(compute_mmd(xc, yc, gamma, unbiased=True))
     return torch.stack(terms).mean()
 
 
@@ -144,12 +172,25 @@ def pairwise_mmd(
     fixed_gammas: dict[tuple[str, str], float] | None = None,
     target_cohort: str | None = None,
     labels: dict[str, torch.Tensor] | None = None,
+    target_pair_weight: float = 1.0,
+    pair_weights: dict[tuple[str, str], float] | None = None,
+    stratified_stats: dict | None = None,
 ) -> tuple[torch.Tensor, dict[tuple[str, str], float]]:
     # pairs touching target_cohort stay pooled; source-source pairs stratify
     # when labels are present for both sides. Caller must omit target's
     # labels -- this function only enforces the target_cohort side of it.
+    #
+    # weighting precedence: pair_weights (explicit dict, used by adaptive
+    # mode below) overrides target_pair_weight entirely when given. Neither
+    # given -> plain uniform mean (old behavior). Weights are plain floats,
+    # not tensors -- no gradient flows through the weighting itself, only
+    # through the underlying MMD terms.
+    #
+    # stratified_stats, if given, is passed straight through to
+    # compute_mmd_stratified's out_stats -- see there for what it collects.
     names = list(zs.keys())
     terms = {}
+    weights = {}
     for a, b in itertools.combinations(names, 2):
         if fixed_gammas is not None:
             gamma = fixed_gammas[(a, b)]
@@ -162,11 +203,19 @@ def pairwise_mmd(
         has_labels = labels is not None and a in labels and b in labels
 
         if not touches_target and has_labels:
-            terms[(a, b)] = compute_mmd_stratified(zs[a], zs[b], labels[a], labels[b], gamma=gamma)
+            terms[(a, b)] = compute_mmd_stratified(
+                zs[a], zs[b], labels[a], labels[b], gamma=gamma, out_stats=stratified_stats
+            )
         else:
             terms[(a, b)] = compute_mmd(zs[a], zs[b], gamma=gamma)
 
-    avg = torch.stack(list(terms.values())).mean()
+        if pair_weights is not None:
+            weights[(a, b)] = pair_weights[(a, b)]
+        else:
+            weights[(a, b)] = target_pair_weight if touches_target else 1.0
+
+    total_weight = sum(weights.values())
+    avg = sum(weights[pair] * terms[pair] for pair in terms) / total_weight
     terms_logged = {k: v.item() for k, v in terms.items()}
     return avg, terms_logged
 
@@ -237,6 +286,10 @@ def train_harmonization_multi(
     decoder_freeze_epoch: int | None = None,
     latent_gamma_mode: str = "adaptive",
     target_cohort: str | None = None,
+    target_pair_weight: float = 1.0,
+    pair_weighting: str = "static",
+    weighting_ema_beta: float = 0.9,
+    weighting_temperature: float = 1.0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     patience: int = 100,
     checkpoint_path: str | None = "best_harmonization_multi.pt",
@@ -245,16 +298,38 @@ def train_harmonization_multi(
     lambda_clf : weight on model.aux_clf's BCE loss, gated the same way as
                  lambda_mmd -- 0 during stage 1, lambda_clf from
                  decoder_freeze_epoch on. Only ever computed on SOURCE
-                 (non-target) cohorts' patients -- same guard that already
-                 keeps target's labels out of batch_labels for stratified
-                 MMD covers this too, since clf_loss is built from that
-                 same dict. Runs alongside recon/mmd in one loss.backward()
-                 call every step (not a separate post-training fine-tune
-                 phase), so MMD's alignment pressure is never absent while
-                 this pushes for separability -- see HarmonizationModel.classify.
+                 (non-target) cohorts' patients.
+    target_pair_weight : static multiplier (>1 upweights, <1 downweights)
+                 applied to any cohort pair touching target_cohort. Only
+                 used when pair_weighting="static" (the default).
+    pair_weighting : "static" uses target_pair_weight, fixed for the whole
+                 run. "adaptive" instead tracks an exponential moving
+                 average of each pair's own MMD value and weights pairs
+                 proportionally to their (smoothed) current difficulty --
+                 a harder-to-align pair gets more gradient. The EMA is
+                 always ONE STEP LAGGED: a batch's weights come from the
+                 EMA as it stood BEFORE that batch, and only get updated
+                 with that batch's results afterward -- so no batch's
+                 weight is derived from its own value, which is what
+                 keeps this from being self-referential/gameable even
+                 though nothing here uses gradient-based weighting.
+                 Still noisy: MMD at small batch sizes is a high-variance
+                 estimator, and weighting_ema_beta close to 1 is the main
+                 defense against chasing single-batch noise -- higher beta
+                 (e.g. 0.95+) smooths harder at the cost of reacting slower
+                 to genuine, sustained shifts in which pair is hardest.
+    weighting_ema_beta : EMA decay for pair_weighting="adaptive". new_ema =
+                 beta*old_ema + (1-beta)*this_batch_value.
+    weighting_temperature : exponent applied to each pair's EMA value
+                 (ema ** (1/temperature)) before use as a weight. 1.0 =
+                 weight directly proportional to smoothed MMD magnitude.
+                 <1 sharpens toward whichever pair is currently hardest;
+                 >1 flattens back toward uniform. Only used in adaptive mode.
     """
     if latent_gamma_mode not in ("adaptive", "fixed"):
         raise ValueError(f"latent_gamma_mode must be 'adaptive' or 'fixed', got {latent_gamma_mode!r}")
+    if pair_weighting not in ("static", "adaptive"):
+        raise ValueError(f"pair_weighting must be 'static' or 'adaptive', got {pair_weighting!r}")
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -269,16 +344,12 @@ def train_harmonization_multi(
 
     # cohort with the most training patients paces the epoch; every other
     # cohort's train loader oversamples (with replacement) up to that count.
-    # Source-cohort class-balance weighting applies regardless of whether
-    # that cohort happens to be the driver.
     driver_name = max(cohort_names, key=lambda n: len(cohort_train[n]))
     driver_size = len(cohort_train[driver_name])
 
-    # class-imbalance correction for aux_clf, matching cnn.py's convention --
-    # computed from TRAIN patients of source (non-target) cohorts only.
-    # Empty (and pos_weight=None, lambda_clf inert) when target_cohort=None --
-    # mirrors stratified MMD's own "None disables it everywhere" behavior;
-    # aux_clf never fires without a designated target_cohort either.
+    # class-imbalance correction for aux_clf -- computed from TRAIN patients
+    # of source (non-target) cohorts only. Empty (pos_weight=None,
+    # lambda_clf inert) when target_cohort=None.
     source_cohorts = [n for n in cohort_names if target_cohort is not None and n != target_cohort]
     source_train_patients = [p for n in source_cohorts for p in cohort_train[n]]
     if source_train_patients:
@@ -286,11 +357,15 @@ def train_harmonization_multi(
         n_neg = len(source_train_patients) - n_pos
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
     else:
-        pos_weight = None   # lambda_clf effectively inert -- no source cohort to draw labels from
+        pos_weight = None
 
     print(f"cohorts      : {cohort_names}  ({n_pairs} pairs)")
     print(f"target       : {target_cohort!r}  (pairs touching it stay pooled)")
     print(f"stratified   : {stratified_pairs}")
+    print(f"pair weighting: {pair_weighting}" + (
+        f"  (target_pair_weight={target_pair_weight})" if pair_weighting == "static"
+        else f"  (ema_beta={weighting_ema_beta}, temperature={weighting_temperature})"
+    ))
     print(f"aux clf on   : {source_cohorts}  (lambda_clf={lambda_clf}, pos_weight={pos_weight})")
     print(f"driver cohort: {driver_name!r} ({driver_size} patients) -- others oversampled to match")
     print(f"latent gamma : {latent_gamma_mode}")
@@ -322,6 +397,22 @@ def train_harmonization_multi(
     best_state = None
     epochs_since_improvement = 0
 
+    # adaptive weighting state -- one EMA value per pair, lazily initialized
+    # on the first stage-2 batch (no smoothing needed for a single sample).
+    # WEIGHTING_FLOOR guards against MMD's estimator occasionally landing
+    # slightly negative at small batch sizes (kxx+kyy-2kxy is not clipped
+    # at 0), which would otherwise make a weight negative or zero.
+    WEIGHTING_FLOOR = 1e-3
+    pair_mmd_ema: dict[tuple[str, str], float] | None = None
+
+    def _current_pair_weights() -> dict[tuple[str, str], float] | None:
+        if pair_weighting != "adaptive" or pair_mmd_ema is None:
+            return None  # static mode, or adaptive but not yet observed a batch -- caller falls back
+        return {
+            pair: max(val, WEIGHTING_FLOOR) ** (1.0 / weighting_temperature)
+            for pair, val in pair_mmd_ema.items()
+        }
+
     for epoch in range(n_epochs):
         if decoder_freeze_epoch is not None and epoch == decoder_freeze_epoch and not decoder_frozen:
             model.set_decoder_trainable(False)
@@ -352,6 +443,7 @@ def train_harmonization_multi(
         train_mmd_image  = 0.0
         train_clf        = 0.0
         n_train_batches = 0
+        epoch_stratified_stats: dict = {}
 
         for batch_dict in _cycling_batches(train_loaders):
             optimizer.zero_grad()
@@ -381,14 +473,29 @@ def train_harmonization_multi(
                 }
                 print(f"epoch {epoch:3d}  -- latent gamma frozen at stage-2 start: {fixed_latent_gammas}")
 
-            mmd_latent, _ = pairwise_mmd(
+            mmd_latent, mmd_terms_this_step = pairwise_mmd(
                 zs, fixed_gammas=fixed_latent_gammas,
                 target_cohort=target_cohort, labels=batch_labels,
+                target_pair_weight=target_pair_weight,
+                pair_weights=_current_pair_weights(),
+                stratified_stats=epoch_stratified_stats,
             )
             loss = recon + lambda_mmd_t * mmd_latent + lambda_clf_t * clf_loss
 
             loss.backward()
             optimizer.step()
+
+            if pair_weighting == "adaptive" and lambda_mmd_t != 0.0:
+                # lagged update: this step's WEIGHTS came from the EMA as it
+                # stood before this step; only now does this step's own
+                # result get folded in, for the NEXT step to use.
+                if pair_mmd_ema is None:
+                    pair_mmd_ema = dict(mmd_terms_this_step)
+                else:
+                    for pair, val in mmd_terms_this_step.items():
+                        pair_mmd_ema[pair] = (
+                            weighting_ema_beta * pair_mmd_ema[pair] + (1 - weighting_ema_beta) * val
+                        )
 
             with torch.no_grad():
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
@@ -435,6 +542,8 @@ def train_harmonization_multi(
                 mmd_latent, _ = pairwise_mmd(
                     zs, fixed_gammas=fixed_latent_gammas,
                     target_cohort=target_cohort, labels=batch_labels,
+                    target_pair_weight=target_pair_weight,
+                    pair_weights=_current_pair_weights(),  # frozen for val -- never updated from val batches
                 )
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
@@ -458,33 +567,29 @@ def train_harmonization_multi(
                 f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  "
                 f"mmd_z {val_mmd_latent:.6f}  mmd_img {val_mmd_image:.6f}  clf {val_clf:.5f})"
             )
+            if pair_weighting == "adaptive" and pair_mmd_ema is not None:
+                w = _current_pair_weights()
+                print(f"              adaptive weights: { {k: round(v, 4) for k, v in w.items()} }")
+            if epoch_stratified_stats.get("per_class_n"):
+                ns = epoch_stratified_stats["per_class_n"]
+                n_low = epoch_stratified_stats.get("n_below_2", 0)
+                print(f"              stratified per-class n this epoch: min={min(ns)} "
+                      f"median={sorted(ns)[len(ns)//2]}  (n<2, biased-fallback count: {n_low}/{len(ns)})")
 
-        # Early stopping only activates once the decoder is frozen (or from
-        # epoch 0 if decoder_freeze_epoch=None, i.e. no staging at all).
-        # Without this gate, stage 1's val_loss (pure recon, MMD/clf both
-        # forced to 0) can plateau and trigger patience on its own --
-        # stopping training before decoder_freeze_epoch is ever reached,
-        # regardless of what decoder_freeze_epoch is set to. The reset at
-        # freeze time (best_val_loss=inf, epochs_since_improvement=0, a few
-        # lines up) only helps AFTER the freeze happens; it does nothing to
-        # stop stage 1 from independently ending the run first.
-        patience_active = decoder_freeze_epoch is None or decoder_frozen
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            epochs_since_improvement = 0
+            best_state = copy.deepcopy(model.state_dict())
+            if checkpoint_path is not None:
+                torch.save(best_state, checkpoint_path)
+        else:
+            epochs_since_improvement += 1
 
-        if patience_active:
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                epochs_since_improvement = 0
-                best_state = copy.deepcopy(model.state_dict())
-                if checkpoint_path is not None:
-                    torch.save(best_state, checkpoint_path)
-            else:
-                epochs_since_improvement += 1
-
-            if epochs_since_improvement >= patience:
-                print(f"no val_loss improvement for {patience} epochs "
-                      f"(best was {best_val_loss:.5f} at epoch {best_epoch}) -- stopping early")
-                break
+        if epochs_since_improvement >= patience:
+            print(f"no val_loss improvement for {patience} epochs "
+                  f"(best was {best_val_loss:.5f} at epoch {best_epoch}) -- stopping early")
+            break
 
     print(f"training done -- best val_loss {best_val_loss:.5f} at epoch {best_epoch}")
     if best_state is not None:
