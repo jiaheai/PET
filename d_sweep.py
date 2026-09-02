@@ -29,7 +29,6 @@ from d_3 import (
     alternating_classifier_finetune,
 )
 from nifti_loader import load_all_cohorts
-from cnn import zscore_shift_correct
 
 DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "alt_sweep_multi_results.jsonl"
@@ -251,8 +250,6 @@ def evaluate_target(
     prob_harm, y_harm = predict_probs(model, target_harmonization)
     prob_target, y_target = predict_probs(model, target_heldout)
 
-    prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
-
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
@@ -260,7 +257,6 @@ def evaluate_target(
         "known_cohort_insample": eval_on(y_known, prob_known),
         "target_cohort_harmonization_half": eval_on(y_harm, prob_harm),
         "target_cohort_raw": eval_on(y_target, prob_target),
-        "target_cohort_corrected": eval_on(y_target, prob_target_corrected),
     }
 
 
@@ -356,7 +352,6 @@ if __name__ == "__main__":
             print(f"  known cohorts (in-sample)      : {r['known_cohort_insample']}")
             print(f"  {target_cohort} (harmonization half) : {r['target_cohort_harmonization_half']}")
             print(f"  {target_cohort} (held out, raw)       : {r['target_cohort_raw']}")
-            print(f"  {target_cohort} (held out, corrected) : {r['target_cohort_corrected']}")
 
     summary_stats = []
     for target_cohort in COHORT_NAMES:
@@ -364,10 +359,8 @@ if __name__ == "__main__":
         if not subset:
             continue
         summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (held-out, raw)"))
-        summary_stats.append(summarize(subset, "target_cohort_corrected", f"target={target_cohort} (held-out, z-score corrected)"))
 
     summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (held-out, raw)"))
-    summary_stats.append(summarize(results, "target_cohort_corrected", "ALL target cohorts pooled (held-out, z-score corrected)"))
 
     for s in summary_stats:
         append_summary(s, results_path)
