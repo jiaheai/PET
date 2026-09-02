@@ -376,7 +376,7 @@ def train_harmonization_multi(
         raise ValueError("weighting_temperature must be nonzero")
 
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     decoder_frozen = False
     fixed_latent_gammas: dict | None = None
     cohort_names = list(cohort_train.keys())
@@ -467,7 +467,7 @@ def train_harmonization_multi(
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
             old_state = {p: optimizer.state[p] for p in trainable_params if p in optimizer.state}
-            optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
+            optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-5)
             optimizer.state.update(old_state)
 
             epochs_since_improvement = 0
@@ -692,7 +692,7 @@ def finetune_classifier_only(
     trainable_params = list(model.aux_clf.parameters())
     for name in source_cohorts:
         trainable_params += list(model.encoders[name].parameters())
-    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-5)
 
     source_train_patients = [p for name in source_cohorts for p in cohort_train[name]]
     n_pos = sum(p.label for p in source_train_patients)
@@ -826,7 +826,7 @@ def alternating_classifier_finetune(
     function's docstring for the target-transfer collapse it produced),
     MMD never leaves the loss here, every round. Unlike
     train_harmonization_multi's lambda_clf (aux_clf jointly trained by
-    Adam, sharing the encoder's optimizer, never fully converged), the
+    AdamW, sharing the encoder's optimizer, never fully converged), the
     classifier supplying gradient each round is always a complete sklearn
     fit -- stronger, standardized, converged -- not a proxy for one.
 
@@ -942,7 +942,7 @@ def alternating_classifier_finetune(
         trainable_params = []
         for name in cohort_names:
             trainable_params += list(model.encoders[name].parameters())
-        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-5)
 
         # adaptive weighting state -- fresh per round, see docstring
         pair_mmd_ema: dict[tuple[str, str], float] | None = None
