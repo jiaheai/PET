@@ -1,31 +1,15 @@
 """
 build 2 autoencoders, then train one classifier on the concat latent space of all augsburg, and test on concat of pre-rapid's TRULY held-out half
 
-Two things changed from the original version of this baseline:
-
-1. "held out" now means the same thing it means in a_sweep_multi.py /
-   b_sweep_multi.py: PRE-RAPID is split with the SAME TARGET_HOLDOUT_SEED
-   into a harmonization half (which model_pr's autoencoder trains and
-   early-stops on -- unsupervised, its labels are never used) and a
-   held-out half that NEVER touches training in any way. Before this
-   fix, model_pr was trained on 100% of PRE-RAPID and "held out" only
-   meant "labels weren't used" -- not comparable to the MMD approaches'
-   held-out numbers, where the held-out half is untouched entirely. Now
-   it is a fair comparison.
-
-2. Added an own-encoder-only ablation. encode_concat pushes every patient
-   through BOTH encoders regardless of origin, so an AUGSBURG patient's
-   features include encoder_pr(augsburg_patient) -- an out-of-distribution
-   input run through an encoder that's never seen anything like it. If
-   the two cohorts have different class prevalence, "how OOD do I look to
-   the other cohort's encoder" is a free proxy for cohort identity, and a
-   classifier can exploit that as a shortcut instead of real signal,
-   inflating apparent transfer without it being real. The ablation fits
-   and evaluates a classifier on each patient's OWN-cohort encoder output
-   only (no concatenation) so you can compare: if held-out performance
-   collapses without the cross-encoder half, that's evidence of the
-   shortcut; if it holds up, the concat features are probably adding
-   real cross-cohort signal.
+Changed from the original version of this baseline: "held out" now means
+the same thing it means in a_sweep_multi.py / b_sweep_multi.py. PRE-RAPID
+is split with the SAME TARGET_HOLDOUT_SEED into a harmonization half
+(which model_pr's autoencoder trains and early-stops on -- unsupervised,
+its labels are never used) and a held-out half that NEVER touches
+training in any way. Before this fix, model_pr was trained on 100% of
+PRE-RAPID and "held out" only meant "labels weren't used" -- not
+comparable to the MMD approaches' held-out numbers, where the held-out
+half is untouched entirely. Now it is a fair comparison.
 """
 
 from __future__ import annotations
@@ -247,29 +231,6 @@ def encode_concat(
     return np.stack(zs), np.array(ys)
 
 
-def encode_own(
-    own_encoder: Encoder3D,
-    patients: list,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Ablation counterpart to encode_concat: each patient through ONLY
-    their own cohort's encoder, no concatenation, no cross-encoder OOD
-    pass. Returns (Z, y): Z is (N, latent_dim), y is (N,) labels. Compare
-    a classifier fit/evaluated on this against the concat version -- if
-    held-out performance collapses without the cross-encoder half, that's
-    evidence the concat features were exploiting a cohort-identity
-    shortcut rather than real cross-cohort signal.
-    """
-    own_encoder = own_encoder.to(device).eval()
-    zs, ys = [], []
-    with torch.no_grad():
-        for p in patients:
-            vol = torch.from_numpy(p.pet_masked.astype("float32")).unsqueeze(0).unsqueeze(0).to(device)
-            zs.append(own_encoder(vol).squeeze(0).cpu().numpy())
-            ys.append(p.label)
-    return np.stack(zs), np.array(ys)
-
-
 def eval_on(clf, Z, y, label) -> None:
     y_pred = clf.predict(Z)
     y_prob = clf.predict_proba(Z)[:, 1]
@@ -341,34 +302,12 @@ if __name__ == "__main__":
     Z_pr_heldout_concat, y_pr_h = encode_concat(model_aug.encoder, model_pr.encoder, pr_heldout)
     print(f"\nconcatenated latent shape: {Z_aug_concat.shape}  (should be N x {2*64})")
 
-    # -- own-encoder-only latents: ablation, no cross-encoder OOD pass ------
-    Z_aug_own,      _ = encode_own(model_aug.encoder, aug_patients)
-    Z_pr_heldout_own, _ = encode_own(model_pr.encoder, pr_heldout)
-
-    # -- classifiers: fit on ALL of AUGSBURG, test on PRE-RAPID's TRULY ------
-    # held-out half only. One classifier per feature set (concat vs
-    # own-encoder-only) so the two can be compared directly.
+    # -- classifier: fit on ALL of AUGSBURG's concat latents, test on -------
+    # PRE-RAPID's TRULY held-out half only.
     clf_concat = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
     clf_concat.fit(Z_aug_concat, y_aug)
 
-    clf_own = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
-    clf_own.fit(Z_aug_own, y_aug)
-
-    print("\n" + "=" * 60)
-    print("CONCAT FEATURES (both encoders, every patient)")
-    print("=" * 60)
     eval_on(clf_concat, Z_pr_heldout_concat, y_pr_h,
             f"HELD-OUT COHORT ({HOLDOUT_COHORT}, held-out half, concatenated latents)")
     eval_on(clf_concat, Z_aug_concat, y_aug,
             f"TRAIN COHORT, in-sample ({TRAIN_COHORT}, concatenated latents, all patients)")
-
-    print("\n" + "=" * 60)
-    print("OWN-ENCODER-ONLY FEATURES (ablation -- no cross-encoder OOD pass)")
-    print("If held-out performance collapses here relative to the concat")
-    print("version above, the concat features were likely exploiting a")
-    print("cohort-identity shortcut rather than real cross-cohort signal.")
-    print("=" * 60)
-    eval_on(clf_own, Z_pr_heldout_own, y_pr_h,
-            f"HELD-OUT COHORT ({HOLDOUT_COHORT}, held-out half, own-encoder-only latents)")
-    eval_on(clf_own, Z_aug_own, y_aug,
-            f"TRAIN COHORT, in-sample ({TRAIN_COHORT}, own-encoder-only latents, all patients)")

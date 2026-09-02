@@ -31,7 +31,7 @@ from d_3 import (
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct
 
-DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS-ZSCORE"
+DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "alt_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
@@ -53,7 +53,18 @@ ALT_LAMBDA_MMD       = 100   # MMD weight during alternating rounds -- kept equa
                               # LAMBDA_MMD by default; change independently if you want to test
                               # a different alignment strength for the fine-tune phase specifically
 ALT_LR               = 1e-4
-ALT_FINAL_FIT_ONLY   = True
+
+# -- adaptive pair weighting (applied in BOTH stage 1-2 and every alternating
+# round -- see train_harmonization_multi / alternating_classifier_finetune
+# docstrings for the full mechanics). "static" + target_pair_weight=1.0 is a
+# no-op, identical to having no weighting at all -- change PAIR_WEIGHTING to
+# "adaptive" to actually turn this on.
+PAIR_WEIGHTING       = "adaptive"
+TARGET_PAIR_WEIGHT   = 1.0
+WEIGHTING_EMA_BETA    = 0.9
+WEIGHTING_TEMPERATURE = 1.0
+WEIGHTING_FLOOR       = 1e-3
+WEIGHTING_CEIL        = 10.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,11 +176,18 @@ def train_model_once(
     cohort_train, cohort_val, cohort_all = {}, {}, {}
     for name in COHORT_NAMES:
         cohort_all[name] = all_cohorts[name]
-        patients_for_training = target_harmonization if name == target_cohort else all_cohorts[name]
+        is_target = name == target_cohort
+        patients_for_training = target_harmonization if is_target else all_cohorts[name]
 
+        # target's split is NOT label-stratified -- a real deployment-time
+        # unlabeled target cohort has no labels to stratify by, so
+        # stratifying here would be testing under friendlier conditions
+        # than the model will actually see. Known (source) cohorts keep
+        # stratification since their labels genuinely drive lambda_clf
+        # (during the alternating fine-tune) and the classifier fit.
         train_p, val_p = train_test_split(
             patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
-            stratify=[p.label for p in patients_for_training],
+            stratify=None if is_target else [p.label for p in patients_for_training],
         )
         cohort_train[name] = train_p
         cohort_val[name] = val_p
@@ -187,6 +205,12 @@ def train_model_once(
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
         latent_gamma_mode=LATENT_GAMMA_MODE,
         target_cohort=target_cohort,
+        target_pair_weight=TARGET_PAIR_WEIGHT,
+        pair_weighting=PAIR_WEIGHTING,
+        weighting_ema_beta=WEIGHTING_EMA_BETA,
+        weighting_temperature=WEIGHTING_TEMPERATURE,
+        weighting_floor=WEIGHTING_FLOOR,
+        weighting_ceil=WEIGHTING_CEIL,
         checkpoint_path=None,
         patience=PATIENCE,
     )
@@ -200,8 +224,13 @@ def train_model_once(
         epochs_per_round=ALT_EPOCHS_PER_ROUND,
         lambda_mmd=ALT_LAMBDA_MMD,
         lr=ALT_LR,
+        target_pair_weight=TARGET_PAIR_WEIGHT,
+        pair_weighting=PAIR_WEIGHTING,
+        weighting_ema_beta=WEIGHTING_EMA_BETA,
+        weighting_temperature=WEIGHTING_TEMPERATURE,
+        weighting_floor=WEIGHTING_FLOOR,
+        weighting_ceil=WEIGHTING_CEIL,
         checkpoint_path=None,
-        final_fit_only=ALT_FINAL_FIT_ONLY,
     )
 
     return model, cohort_all, target_harmonization, target_heldout
@@ -280,7 +309,7 @@ if __name__ == "__main__":
     print(f"results path : {results_path}")
     print(f"cohorts      : {COHORT_NAMES}")
     print(f"alt fine-tune: {ALT_N_ROUNDS} rounds x {ALT_EPOCHS_PER_ROUND} epochs  "
-          f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}  final_fit_only={ALT_FINAL_FIT_ONLY}")
+          f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}")
 
     all_cohorts = load_all_cohorts(data_path)
     for name in COHORT_NAMES:

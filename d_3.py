@@ -12,7 +12,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 
-DATA_PATH          = "CUBES-Labelled-COHORTS-ZSCORE"
+DATA_PATH          = "CUBES-Labelled-COHORTS"
 DOMAIN_SHIFT_GAMMA = 5.3919e-06
 
 COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
@@ -94,12 +94,29 @@ class HarmonizationModel(nn.Module):
             p.requires_grad = trainable
 
 
-def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float) -> torch.Tensor:
+def compute_mmd(x: torch.Tensor, y: torch.Tensor, gamma: float, unbiased: bool = False) -> torch.Tensor:
+    """unbiased=True uses the U-statistic (excludes self-comparisons from the
+    kxx/kyy means) instead of the V-statistic. The V-statistic's diagonal
+    terms are always exactly 1 (self-kernel), which biases kxx/kyy upward by
+    O(1/n) -- negligible at large n, but severe at the small per-class n the
+    stratified path can hit (see compute_mmd_stratified). Falls back to
+    biased automatically if n<2 on either side -- a U-statistic needs at
+    least 2 samples to form an off-diagonal average at all.
+    """
     def rbf(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.exp(-gamma * torch.cdist(a, b).pow(2))
 
-    kxx = rbf(x, x).mean()
-    kyy = rbf(y, y).mean()
+    n, m = x.size(0), y.size(0)
+    use_unbiased = unbiased and n >= 2 and m >= 2
+
+    if use_unbiased:
+        kxx_full, kyy_full = rbf(x, x), rbf(y, y)
+        kxx = (kxx_full.sum() - kxx_full.diagonal().sum()) / (n * (n - 1))
+        kyy = (kyy_full.sum() - kyy_full.diagonal().sum()) / (m * (m - 1))
+    else:
+        kxx = rbf(x, x).mean()
+        kyy = rbf(y, y).mean()
+
     kxy = rbf(x, y).mean()
     return kxx + kyy - 2 * kxy
 
@@ -110,8 +127,16 @@ def compute_mmd_stratified(
     x_labels: torch.Tensor,
     y_labels: torch.Tensor,
     gamma: float,
+    out_stats: dict | None = None,
 ) -> torch.Tensor:
-    # source-source only -- never call this on a pair touching an unlabeled target
+    # source-source only -- never call this on a pair touching an unlabeled target.
+    # Always requests the unbiased U-statistic per class (see compute_mmd) --
+    # splitting an already-small batch by class routinely lands at n=1-3 per
+    # class, where the biased V-statistic overestimates MMD badly (empirically
+    # ~1.5 at n=1 for two IDENTICAL distributions, vs the correct ~0).
+    # out_stats, if given, accumulates diagnostics: 'per_class_n' (list of
+    # min(n,m) seen per class this call) and 'n_below_2' (count of classes
+    # that had to fall back to biased because n<2 on one side).
     common_classes = sorted(set(x_labels.tolist()) & set(y_labels.tolist()))
     if not common_classes:
         return compute_mmd(x, y, gamma)  # no shared class this batch -- fall back to pooled
@@ -120,7 +145,12 @@ def compute_mmd_stratified(
     for c in common_classes:
         xc = x[x_labels == c]
         yc = y[y_labels == c]
-        terms.append(compute_mmd(xc, yc, gamma))
+        n, m = xc.size(0), yc.size(0)
+        if out_stats is not None:
+            out_stats.setdefault("per_class_n", []).append(min(n, m))
+            if n < 2 or m < 2:
+                out_stats["n_below_2"] = out_stats.get("n_below_2", 0) + 1
+        terms.append(compute_mmd(xc, yc, gamma, unbiased=True))
     return torch.stack(terms).mean()
 
 
@@ -144,12 +174,26 @@ def pairwise_mmd(
     fixed_gammas: dict[tuple[str, str], float] | None = None,
     target_cohort: str | None = None,
     labels: dict[str, torch.Tensor] | None = None,
+    target_pair_weight: float = 1.0,
+    pair_weights: dict[tuple[str, str], float] | None = None,
+    stratified_stats: dict | None = None,
 ) -> tuple[torch.Tensor, dict[tuple[str, str], float]]:
     # pairs touching target_cohort stay pooled; source-source pairs stratify
     # when labels are present for both sides. Caller must omit target's
     # labels -- this function only enforces the target_cohort side of it.
+    #
+    # weighting precedence: pair_weights (explicit dict, used by adaptive
+    # mode) overrides target_pair_weight entirely when given. Neither given
+    # -> plain uniform mean (old behavior). Weights are plain floats, not
+    # tensors -- no gradient flows through the weighting itself, only
+    # through the underlying MMD terms.
+    #
+    # stratified_stats, if given, is passed straight through to
+    # compute_mmd_stratified's out_stats -- see there for what it collects.
+    # Optional and unused by default; no caller currently passes it.
     names = list(zs.keys())
     terms = {}
+    weights = {}
     for a, b in itertools.combinations(names, 2):
         if fixed_gammas is not None:
             gamma = fixed_gammas[(a, b)]
@@ -162,11 +206,19 @@ def pairwise_mmd(
         has_labels = labels is not None and a in labels and b in labels
 
         if not touches_target and has_labels:
-            terms[(a, b)] = compute_mmd_stratified(zs[a], zs[b], labels[a], labels[b], gamma=gamma)
+            terms[(a, b)] = compute_mmd_stratified(
+                zs[a], zs[b], labels[a], labels[b], gamma=gamma, out_stats=stratified_stats
+            )
         else:
             terms[(a, b)] = compute_mmd(zs[a], zs[b], gamma=gamma)
 
-    avg = torch.stack(list(terms.values())).mean()
+        if pair_weights is not None:
+            weights[(a, b)] = pair_weights[(a, b)]
+        else:
+            weights[(a, b)] = target_pair_weight if touches_target else 1.0
+
+    total_weight = sum(weights.values())
+    avg = sum(weights[pair] * terms[pair] for pair in terms) / total_weight
     terms_logged = {k: v.item() for k, v in terms.items()}
     return avg, terms_logged
 
@@ -237,6 +289,12 @@ def train_harmonization_multi(
     decoder_freeze_epoch: int | None = None,
     latent_gamma_mode: str = "adaptive",
     target_cohort: str | None = None,
+    target_pair_weight: float = 1.0,
+    pair_weighting: str = "static",
+    weighting_ema_beta: float = 0.9,
+    weighting_temperature: float = 1.0,
+    weighting_floor: float = 1e-3,
+    weighting_ceil: float = 10.0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     patience: int = 100,
     checkpoint_path: str | None = "best_harmonization_multi.pt",
@@ -252,9 +310,70 @@ def train_harmonization_multi(
                  call every step (not a separate post-training fine-tune
                  phase), so MMD's alignment pressure is never absent while
                  this pushes for separability -- see HarmonizationModel.classify.
+    target_pair_weight : static multiplier (>1 upweights, <1 downweights)
+                 applied to any cohort pair touching target_cohort. Only
+                 used when pair_weighting="static" (the default).
+    pair_weighting : "static" uses target_pair_weight, fixed for the whole
+                 run. "adaptive" instead tracks an exponential moving
+                 average of each pair's own MMD magnitude and weights pairs
+                 proportionally to their (smoothed) current difficulty -- a
+                 pair with more residual misalignment right now gets more
+                 gradient, full stop. No reference point, no warmup window:
+                 weight tracks raw magnitude directly, not progress relative
+                 to where a pair started. Simpler than a reference-ratio
+                 scheme, and doesn't carry that scheme's failure mode of a
+                 single bad early snapshot permanently distorting every
+                 later weight (this EMA has no permanent anchor -- a noisy
+                 seed's influence decays away over subsequent steps instead
+                 of being locked in). Tradeoff: can't distinguish "made real
+                 progress but is still numerically bigger" from "never
+                 moved at all" -- weight is driven by current scale, not
+                 trajectory. gamma_fn's per-pair median-heuristic bandwidth
+                 already roughly scale-normalizes different pairs' MMD
+                 values before this sees them, which partially (not fully)
+                 offsets that.
+                 The EMA is always ONE STEP LAGGED: a batch's weights come
+                 from the EMA as it stood BEFORE that batch, and only get
+                 updated with that batch's results afterward. This is
+                 purely a variance-reduction measure -- MMD at small batch
+                 sizes is a high-variance estimator, and the lag just keeps
+                 a single noisy batch from being both the thing optimized
+                 and its own weight in the same step. It is NOT preventing
+                 anything "gameable": these are detached floats with no
+                 gradient path through the weighting itself, so there was
+                 never a self-referential-optimization risk to guard
+                 against. Still noisy: weighting_ema_beta close to 1 is the
+                 main defense against chasing single-batch noise -- higher
+                 beta (e.g. 0.95+) smooths harder at the cost of reacting
+                 slower to genuine, sustained shifts in which pair is
+                 hardest.
+    weighting_ema_beta : EMA decay for pair_weighting="adaptive". new_ema =
+                 beta*old_ema + (1-beta)*this_batch_value.
+    weighting_temperature : exponent applied to each pair's clamped EMA
+                 value (ema ** (1/temperature)) before use as a weight.
+                 1.0 = weight directly proportional to smoothed MMD
+                 magnitude. <1 sharpens toward whichever pair is currently
+                 hardest; >1 flattens back toward uniform. Only used in
+                 adaptive mode.
+    weighting_floor, weighting_ceil : clamp bounds applied to each pair's
+                 weight TWICE -- once before exponentiation and once after.
+                 Both are required, not redundant: clamping the EMA value
+                 to weighting_ceil does not bound the exponentiated result
+                 (e.g. a value clamped to 10.0 becomes 100.0 at
+                 temperature=0.5), so the post-exponent clamp is what
+                 actually stops one pair from dominating the weighted
+                 average. weighting_floor also guards against the
+                 underlying MMD estimator occasionally landing slightly
+                 negative at small batch sizes (kxx+kyy-2kxy is not
+                 clipped at 0), which would otherwise send a fractional
+                 exponent to nan.
     """
     if latent_gamma_mode not in ("adaptive", "fixed"):
         raise ValueError(f"latent_gamma_mode must be 'adaptive' or 'fixed', got {latent_gamma_mode!r}")
+    if pair_weighting not in ("static", "adaptive"):
+        raise ValueError(f"pair_weighting must be 'static' or 'adaptive', got {pair_weighting!r}")
+    if weighting_temperature == 0:
+        raise ValueError("weighting_temperature must be nonzero")
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -291,6 +410,11 @@ def train_harmonization_multi(
     print(f"cohorts      : {cohort_names}  ({n_pairs} pairs)")
     print(f"target       : {target_cohort!r}  (pairs touching it stay pooled)")
     print(f"stratified   : {stratified_pairs}")
+    print(f"pair weighting: {pair_weighting}" + (
+        f"  (target_pair_weight={target_pair_weight})" if pair_weighting == "static"
+        else f"  (ema_beta={weighting_ema_beta}, temperature={weighting_temperature}, "
+             f"floor={weighting_floor}, ceil={weighting_ceil})"
+    ))
     print(f"aux clf on   : {source_cohorts}  (lambda_clf={lambda_clf}, pos_weight={pos_weight})")
     print(f"driver cohort: {driver_name!r} ({driver_size} patients) -- others oversampled to match")
     print(f"latent gamma : {latent_gamma_mode}")
@@ -321,6 +445,20 @@ def train_harmonization_multi(
     best_epoch = -1
     best_state = None
     epochs_since_improvement = 0
+
+    # adaptive weighting state -- one EMA value per pair, lazily initialized
+    # on the first stage-2 batch (no smoothing needed for a single sample).
+    pair_mmd_ema: dict[tuple[str, str], float] | None = None
+
+    def _current_pair_weights() -> dict[tuple[str, str], float] | None:
+        if pair_weighting != "adaptive" or pair_mmd_ema is None:
+            return None  # static mode, or adaptive but not yet observed a batch -- caller falls back
+        weights = {}
+        for pair, ema_val in pair_mmd_ema.items():
+            clamped = min(max(ema_val, weighting_floor), weighting_ceil)
+            w = clamped ** (1.0 / weighting_temperature)
+            weights[pair] = min(max(w, weighting_floor), weighting_ceil)  # re-clamp post-exponent
+        return weights
 
     for epoch in range(n_epochs):
         if decoder_freeze_epoch is not None and epoch == decoder_freeze_epoch and not decoder_frozen:
@@ -381,14 +519,28 @@ def train_harmonization_multi(
                 }
                 print(f"epoch {epoch:3d}  -- latent gamma frozen at stage-2 start: {fixed_latent_gammas}")
 
-            mmd_latent, _ = pairwise_mmd(
+            mmd_latent, mmd_terms_this_step = pairwise_mmd(
                 zs, fixed_gammas=fixed_latent_gammas,
                 target_cohort=target_cohort, labels=batch_labels,
+                target_pair_weight=target_pair_weight,
+                pair_weights=_current_pair_weights(),
             )
             loss = recon + lambda_mmd_t * mmd_latent + lambda_clf_t * clf_loss
 
             loss.backward()
             optimizer.step()
+
+            if pair_weighting == "adaptive" and lambda_mmd_t != 0.0:
+                # lagged update: this step's WEIGHTS came from the EMA as it
+                # stood before this step; only now does this step's own
+                # result get folded in, for the NEXT step to use.
+                if pair_mmd_ema is None:
+                    pair_mmd_ema = dict(mmd_terms_this_step)
+                else:
+                    for pair, val in mmd_terms_this_step.items():
+                        pair_mmd_ema[pair] = (
+                            weighting_ema_beta * pair_mmd_ema[pair] + (1 - weighting_ema_beta) * val
+                        )
 
             with torch.no_grad():
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
@@ -435,6 +587,8 @@ def train_harmonization_multi(
                 mmd_latent, _ = pairwise_mmd(
                     zs, fixed_gammas=fixed_latent_gammas,
                     target_cohort=target_cohort, labels=batch_labels,
+                    target_pair_weight=target_pair_weight,
+                    pair_weights=_current_pair_weights(),  # frozen for val -- never updated from val batches
                 )
                 mmd_image, _ = pairwise_mmd(x_hats, fixed_gamma=DOMAIN_SHIFT_GAMMA)
 
@@ -458,6 +612,9 @@ def train_harmonization_multi(
                 f"val_loss {val_loss:.5f}  (recon {val_recon:.5f}  "
                 f"mmd_z {val_mmd_latent:.6f}  mmd_img {val_mmd_image:.6f}  clf {val_clf:.5f})"
             )
+            if pair_weighting == "adaptive" and pair_mmd_ema is not None:
+                w = _current_pair_weights()
+                print(f"              adaptive weights: { {k: round(v, 4) for k, v in w.items()} }")
 
         # Early stopping only activates once the decoder is frozen (or from
         # epoch 0 if decoder_freeze_epoch=None, i.e. no staging at all).
@@ -632,9 +789,14 @@ def alternating_classifier_finetune(
     lambda_mmd: float = 1.0,
     batch_size: int = 8,
     lr: float = 1e-4,
+    target_pair_weight: float = 1.0,
+    pair_weighting: str = "static",
+    weighting_ema_beta: float = 0.9,
+    weighting_temperature: float = 1.0,
+    weighting_floor: float = 1e-3,
+    weighting_ceil: float = 10.0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     checkpoint_path: str | None = None,
-    final_fit_only: bool = True,
 ) -> HarmonizationModel:
     """Alternating block-coordinate fine-tune, run AFTER train_harmonization_multi
     (stages 1-2) has already produced a harmonized model with its decoder frozen.
@@ -674,15 +836,27 @@ def alternating_classifier_finetune(
     clf_loss: target's patients never enter the label-guarded branch below,
     same invariant enforced everywhere else in this file.
 
-    final_fit_only : if True, after the last round's encoder training
-    finishes, do one more encode-fit-fold pass (steps 1-2 only, no further
-    encoder training) so the classifier left in model.aux_clf is synced to
-    the FINAL z rather than slightly stale from that last round's encoder
-    movement. Adds one sklearn fit, zero extra epochs. Since each round's
-    classifier is already a full fit (not a partially-trained proxy), the
-    classifier in model.aux_clf after this function returns IS the
-    classifier to use for eval -- no separate downstream refit needed.
+    target_pair_weight / pair_weighting / weighting_* : same adaptive
+    pair-weighting scheme as train_harmonization_multi -- raw-magnitude EMA,
+    no reference/warmup -- see that function's docstring for the full
+    mechanics. Here, the EMA state is RESET at the start of every round
+    (each round's optimizer and encoder-training loop is independent), not
+    carried across rounds.
+
+    Each round is scored on cohort_val's source patients using that
+    round's OWN end-of-round refit (fit on that round's post-training z,
+    not the round-start classifier it trained against) -- see the refit
+    placement in the loop below for why. Only the best-scoring round's
+    (encoders, classifier) pair is kept; the classifier in model.aux_clf
+    after this function returns IS the classifier to use for eval -- no
+    separate downstream refit needed, since it was already synced to its
+    own encoders at the moment it was saved as best.
     """
+    if pair_weighting not in ("static", "adaptive"):
+        raise ValueError(f"pair_weighting must be 'static' or 'adaptive', got {pair_weighting!r}")
+    if weighting_temperature == 0:
+        raise ValueError("weighting_temperature must be nonzero")
+
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
@@ -690,6 +864,7 @@ def alternating_classifier_finetune(
     cohort_names = list(cohort_train.keys())
     source_cohorts = [c for c in cohort_names if c != target_cohort]
     source_train_patients = [p for name in source_cohorts for p in cohort_train[name]]
+    val_source_patients = [p for name in source_cohorts for p in cohort_val[name]]
 
     n_pos = sum(p.label for p in source_train_patients)
     n_neg = len(source_train_patients) - n_pos
@@ -742,17 +917,45 @@ def alternating_classifier_finetune(
 
     print(f"alternating fine-tune: {n_rounds} rounds x {epochs_per_round} epochs  "
           f"source={source_cohorts}  target={target_cohort!r} (gets MMD every round, never clf_loss)")
+    print(f"pair weighting: {pair_weighting}" + (
+        f"  (target_pair_weight={target_pair_weight})" if pair_weighting == "static"
+        else f"  (ema_beta={weighting_ema_beta}, temperature={weighting_temperature}, reset every round)"
+    ))
+
+    best_val_clf = float("inf")
+    best_state = copy.deepcopy(model.state_dict())   # fallback: pre-fine-tune state if no round improves
+    best_round = -1
+
+    # initial fit, once, on the pre-fine-tune z -- this is round 0's frozen
+    # target. Each subsequent round's frozen target is set by the PREVIOUS
+    # round's end-of-round refit below, so this call only ever happens once
+    # here, not once per round -- avoids fitting twice in a row on the same
+    # z (once as "end of round N", once as "start of round N+1", which
+    # would just be the same deterministic sklearn fit run redundantly).
+    _fit_and_load_classifier()
+    model.aux_clf.weight.requires_grad = False
+    model.aux_clf.bias.requires_grad = False
 
     for round_idx in range(n_rounds):
-        _fit_and_load_classifier()
-        model.aux_clf.weight.requires_grad = False
-        model.aux_clf.bias.requires_grad = False
-        print(f"round {round_idx:2d}  -- classifier refit + frozen, training encoders for {epochs_per_round} epochs")
+        print(f"round {round_idx:2d}  -- training encoders for {epochs_per_round} epochs against frozen classifier")
 
         trainable_params = []
         for name in cohort_names:
             trainable_params += list(model.encoders[name].parameters())
         optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-5)
+
+        # adaptive weighting state -- fresh per round, see docstring
+        pair_mmd_ema: dict[tuple[str, str], float] | None = None
+
+        def _current_pair_weights() -> dict[tuple[str, str], float] | None:
+            if pair_weighting != "adaptive" or pair_mmd_ema is None:
+                return None
+            weights = {}
+            for pair, ema_val in pair_mmd_ema.items():
+                clamped = min(max(ema_val, weighting_floor), weighting_ceil)
+                w = clamped ** (1.0 / weighting_temperature)
+                weights[pair] = min(max(w, weighting_floor), weighting_ceil)
+            return weights
 
         for epoch in range(epochs_per_round):
             model.train()
@@ -775,22 +978,80 @@ def alternating_classifier_finetune(
                             logit.float(), label.float(), pos_weight=pos_weight
                         )
 
-                mmd_latent, _ = pairwise_mmd(zs, target_cohort=target_cohort, labels=batch_labels)
+                mmd_latent, mmd_terms_this_step = pairwise_mmd(
+                    zs, target_cohort=target_cohort, labels=batch_labels,
+                    target_pair_weight=target_pair_weight,
+                    pair_weights=_current_pair_weights(),
+                )
                 loss = recon + lambda_mmd * mmd_latent + clf_loss
 
                 loss.backward()
                 optimizer.step()
 
-        if checkpoint_path is not None:
-            torch.save(model.state_dict(), checkpoint_path)
+                if pair_weighting == "adaptive":
+                    if pair_mmd_ema is None:
+                        pair_mmd_ema = dict(mmd_terms_this_step)
+                    else:
+                        for pair, val in mmd_terms_this_step.items():
+                            pair_mmd_ema[pair] = (
+                                weighting_ema_beta * pair_mmd_ema[pair] + (1 - weighting_ema_beta) * val
+                            )
 
-    if final_fit_only:
+        # -- refit on THIS round's post-training z before scoring. Scores
+        # "how good is this round's z under its own best-achievable
+        # classifier" rather than "how well does this round's now-stale
+        # round-start classifier generalize" -- the two are different
+        # questions, and the round-start classifier was fit on OLD (pre-
+        # this-round) z, so scoring against it conflates "did the encoder
+        # improve" with "did the encoder stay compatible with an
+        # increasingly stale boundary". This refit also becomes the frozen
+        # target for the NEXT round's encoder training, so it does double
+        # duty -- no separate fit needed at the top of the next iteration.
         _fit_and_load_classifier()
         model.aux_clf.weight.requires_grad = False
         model.aux_clf.bias.requires_grad = False
-        print("final classifier fit synced to post-training z (no further encoder training)")
-        if checkpoint_path is not None:
-            torch.save(model.state_dict(), checkpoint_path)
+
+        # -- validate THIS round's (freshly-refit classifier + its own z)
+        # combo on held-out source patients (cohort_val, never seen by
+        # either the encoder training above or _fit_and_load_classifier's
+        # sklearn fit, which only used cohort_train). This is the safety
+        # net the docstring's own "genuine experiment, real drift risk"
+        # framing calls for -- without it, a late round that's actually
+        # worse than an earlier one would silently overwrite it with no
+        # way to tell and no fallback.
+        model.eval()
+        val_clf = 0.0
+        n_val = 0
+        with torch.no_grad():
+            for p in val_source_patients:
+                vol = torch.from_numpy(p.pet_masked.astype("float32")).unsqueeze(0).unsqueeze(0).to(device)
+                z = model.encode(p.cohort, vol)
+                logit = model.classify(z)
+                label = torch.tensor([float(p.label)], device=device)
+                val_clf += F.binary_cross_entropy_with_logits(
+                    logit.float(), label, pos_weight=pos_weight
+                ).item()
+                n_val += 1
+        val_clf /= max(n_val, 1)
+        print(f"round {round_idx:2d}  -- val_clf (held-out source patients, freshly-refit classifier): {val_clf:.5f}")
+
+        if val_clf < best_val_clf:
+            best_val_clf = val_clf
+            best_round = round_idx
+            best_state = copy.deepcopy(model.state_dict())
+            if checkpoint_path is not None:
+                torch.save(best_state, checkpoint_path)
+
+    print(f"alternating fine-tune done -- best val_clf {best_val_clf:.5f} at round {best_round}")
+    model.load_state_dict(best_state)
+    # No separate "final fit" step needed anymore: best_state was saved
+    # right after that round's own end-of-round refit (see the loop above),
+    # so its classifier is already exactly synced to its own encoders --
+    # refitting again here would just reproduce the same weights via the
+    # same deterministic sklearn solver on the same z. This used to matter
+    # (there was a real final_fit_only toggle) before the round loop was
+    # reordered to refit-then-save instead of save-then-refit; now it's
+    # dead weight, so it's gone rather than kept as a no-op flag.
 
     return model
 

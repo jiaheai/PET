@@ -1,34 +1,26 @@
 """
-Approach A, leave-one-cohort-out sweep across 3 cohorts.
+Shared-encoder approach ("Approach A"), leave-one-cohort-out sweep across
+3 cohorts -- now using harmonization_shared_stratified.py instead of the
+old a_3_multi.py module, so this gets the same non-classifier techniques as the
+per-cohort-encoder sweep: unbiased MMD U-statistic, real target_cohort-
+gated stratified MMD (a_3_multi.py's old shared encoder never had this -- MMD was
+always pooled, aug-side vs pr-side, no per-class split), adaptive pair
+weighting, and class-balanced source-cohort oversampling.
 
-Approach A's shared single encoder means MMD only ever needs two groups
-of volumes to compare -- it never dispatches per-cohort the way the
-multi-encoder approach (b_3_multi/b_3_anchor) does. So the natural 3+
-cohort adaptation needs no logic changes in a.py: train_harmonization's
-"known" cohort is the POOLED known (non-target) cohorts, and its "target"
-cohort is target's harmonization-half -- the model directly aligns
-"everything we have labels for" against "the unlabeled target," which is
-arguably a cleaner match for the actual goal than pairwise/anchor
-mechanics need to approximate.
-
-NOTE: a.py's train_harmonization now takes train_cohorts/val_cohorts as
-{name: [patients]} dicts (generalized for N-cohort support) instead of
-the old train_aug/val_aug/train_pr/val_pr positional args. This sweep
-still only ever passes 2 entries ("known" and "target") -- with N=2,
-compute_mmd_multi reduces to exactly one pairwise MMD term, identical to
-the old behavior -- so nothing about the sweep's actual logic changes,
-only the call site's kwargs below.
+Structural change from the old a_3_multi.py-based version: that script fed
+train_harmonization a single "aug" pooled-known-cohorts side and a single
+"pr" target-harmonization-half side -- two groups, no per-cohort identity
+at all past that point. This version keeps per-cohort dicts (cohort_train/
+cohort_val, one entry per COHORT_NAMES) the same way b_sweep_multi.py
+does, so pairwise_mmd can stratify PAIRS of known cohorts against each
+other (impossible under the old two-group pooling, which only ever had
+one "known" blob and one "target" blob to compare). The encoder itself is
+still fully shared -- only the bookkeeping changed to expose per-cohort
+identity to the loss.
 
 Same 50/50 held-out split as b_sweep_multi.py / cnn_sweep_multi.py, using
 the SAME TARGET_HOLDOUT_SEED -- so target_heldout is identical across all
 three approaches' sweeps, required for a valid cross-approach comparison.
-
-TORCH_SEEDS is also matched to b_sweep_multi.py's count (10, not 5) --
-cross-approach comparison needs equally powered summary stats on both
-sides, not just matched held-out patients. Resume logic below mirrors
-b_sweep_multi.py's for the same reason both scripts need it: 10 seeds x
-1000 epochs is long enough that losing a partial run to a crash or a
-kill is a real cost, not a hypothetical one.
 """
 
 from __future__ import annotations
@@ -39,46 +31,63 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
-from a_3_multi import HarmonizationModel, train_harmonization
+from a_3_multi import (
+    HarmonizationModel,
+    train_harmonization_shared,
+    alternating_classifier_finetune_shared,
+)
 from nifti_loader import load_all_cohorts
 from cnn import zscore_shift_correct   # reuse the same correction used for the CNN baseline
 
-# Defaults -- overridable via --data-path / --results-path for automation.
 DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "a_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(5))    # matched to b_sweep_multi.py -- see module docstring
+TORCH_SEEDS    = list(range(5))
 VAL_SPLIT_SEED = 40             # fixed -- keeps the same val patients across all torch seeds
 TARGET_HOLDOUT_SEED = 123       # fixed -- SAME value as b_sweep_multi.py / cnn_sweep_multi.py,
                                  # so target_heldout is identical across every approach's sweep
+
+# -- stage 1-2 (harmonization) settings -------------------------------------
+N_EPOCHS       = 1000
 LAMBDA_MMD     = 100
 DECODER_FREEZE_EPOCH = 50
-N_EPOCHS       = 1000
-PATIENCE = 20
+PATIENCE = 50
+
+# -- alternating fine-tune settings ------------------------------------------
+ALT_N_ROUNDS         = 5
+ALT_EPOCHS_PER_ROUND = 10
+ALT_LAMBDA_MMD        = 100   # MMD weight during alternating rounds -- kept equal to stage-2's
+                               # LAMBDA_MMD by default; change independently if you want to test
+                               # a different alignment strength for the fine-tune phase specifically
+ALT_LR                = 1e-4
+
+# -- adaptive pair weighting (applied in BOTH stage 1-2 and every alternating
+# round) -- see train_harmonization_shared / alternating_classifier_finetune_shared
+# docstrings for the full mechanics. "static" + target_pair_weight=1.0 is a
+# no-op, identical to having no weighting at all.
+PAIR_WEIGHTING       = "adaptive"   # "static" or "adaptive"
+TARGET_PAIR_WEIGHT   = 1.0
+WEIGHTING_EMA_BETA    = 0.9
+WEIGHTING_TEMPERATURE = 1.0
+WEIGHTING_FLOOR       = 1e-3
+WEIGHTING_CEIL        = 10.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Approach A, leave-one-cohort-out sweep across all cohort combinations and torch seeds"
+        description="Approach A (shared encoder), leave-one-cohort-out sweep across all cohort combinations and torch seeds"
     )
-    parser.add_argument(
-        "--data-path", default=DEFAULT_DATA_PATH,
-        help=f"Directory containing all cohorts' data (default: {DEFAULT_DATA_PATH})",
-    )
-    parser.add_argument(
-        "--results-path", default=DEFAULT_RESULTS_PATH,
-        help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}).",
-    )
+    parser.add_argument("--data-path", default=DEFAULT_DATA_PATH)
+    parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
     parser.add_argument(
         "--fresh", action="store_true",
-        help="Wipe --results-path and rerun every seed from scratch. Default: resume.",
+        help="Wipe --results-path and rerun every seed from scratch. Default: resume -- "
+             "reuse any torch_seed that already has a complete run (all cohorts as "
+             "target) in --results-path.",
     )
     return parser.parse_args()
 
@@ -111,7 +120,6 @@ def load_existing_results(results_path: Path) -> list[dict]:
 
 
 def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
-    # a seed only counts as complete if every cohort has a run record for it
     by_seed: dict[int, set[str]] = {}
     for r in runs:
         by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
@@ -120,11 +128,10 @@ def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
     """Stratified 50/50 split of the target cohort's patients into a
-    harmonization half (enters train_harmonization's "target" side,
-    unsupervised only) and a held-out half (never touches training in any
-    way -- not the harmonization model, not the classifier). Fixed
-    random_state, same value as the other approaches' sweeps, so all
-    three hold out identical patients.
+    harmonization half (the only part of this cohort that enters
+    training) and a held-out half (never touches training in any way).
+    Fixed random_state, same value as the other approaches' sweeps, so
+    all three hold out identical patients.
     """
     harmonization_half, heldout_half = train_test_split(
         patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
@@ -133,18 +140,20 @@ def split_target_cohort(patients: list) -> tuple[list, list]:
     return harmonization_half, heldout_half
 
 
-def encode_patients(
+def predict_probs(
     model: HarmonizationModel,
     patients: list,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Encode patients into latent vectors. Approach A has a single shared
-    encoder with no per-cohort dispatch (model.encode(x) takes no cohort
-    argument at all) -- simpler than the multi-encoder approach's version.
-    """
+    """Reads straight from model.aux_clf. After
+    alternating_classifier_finetune_shared, aux_clf holds a real,
+    fully-converged sklearn fit (folded into linear-layer form), not a
+    jointly-trained proxy -- same principle as b_sweep_multi.py / d
+    (harmonization_stratified.py)'s predict_probs, adapted for the shared
+    encoder's model.encode(vol) with no cohort argument."""
     model = model.to(device)
     model.eval()
-    zs, ys = [], []
+    probs, ys = [], []
     with torch.no_grad():
         for patient in patients:
             vol = (
@@ -152,18 +161,17 @@ def encode_patients(
                 .unsqueeze(0).unsqueeze(0)
                 .to(device)
             )
-            z = model.encode(vol).squeeze(0).cpu().numpy()
-            zs.append(z)
+            z = model.encode(vol)
+            logit = model.classify(z)
+            probs.append(torch.sigmoid(logit).item())
             ys.append(patient.label)
-    return np.stack(zs), np.array(ys)
+    return np.array(probs), np.array(ys)
 
 
-def eval_set(model, clf, plist, prob_override=None) -> dict | None:
-    if not plist:
+def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict | None:
+    if len(y) == 0:
         return None
-    Z, y = encode_patients(model, plist)
-    y_prob = clf.predict_proba(Z)[:, 1] if prob_override is None else prob_override
-    y_pred = (y_prob >= 0.5).astype(int)
+    y_pred = (y_prob >= threshold).astype(int)
     acc = accuracy_score(y, y_pred)
     auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
     tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
@@ -182,45 +190,75 @@ def train_model_once(
     torch_seed: int, all_cohorts: dict, target_cohort: str
 ) -> tuple[HarmonizationModel, dict, list, list]:
     """Train Approach A's shared-encoder model for this (torch_seed,
-    target_cohort) combination. train_harmonization's "known" cohort is
-    the POOLED known (non-target) cohorts; its "target" cohort is
-    target's harmonization-half -- the model has no concept of individual
-    cohort identity beyond this train-time split, since the encoder is
-    fully shared. Retrained per (seed, target_cohort) pair, same reason
-    as the other sweeps: the training data composition changes with
-    target_cohort.
+    target_cohort) combination. Unlike the old a_3_multi.py-based version's single
+    pooled aug/pr split, this keeps per-cohort dicts (cohort_train/
+    cohort_val) so train_harmonization_shared's stratified MMD can
+    actually distinguish AUGSBURG from PRE-RAPID as separate known
+    cohorts, not one merged "known" blob. Retrained per (seed,
+    target_cohort) pair, same reason as every other sweep here: training
+    data composition changes with target_cohort.
     """
     target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
 
-    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
-    known_patients = [p for name in known_cohorts for p in all_cohorts[name]]
+    cohort_train, cohort_val, cohort_all = {}, {}, {}
+    for name in COHORT_NAMES:
+        cohort_all[name] = all_cohorts[name]
+        is_target = name == target_cohort
+        patients_for_training = target_harmonization if is_target else all_cohorts[name]
 
-    train_known, val_known = train_test_split(
-        known_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
-        stratify=[p.label for p in known_patients],
-    )
-    # target's split is NOT label-stratified -- a real deployment-time
-    # unlabeled target cohort has no labels to stratify by, so
-    # stratifying here would be testing under friendlier conditions than
-    # the model will actually see. known_patients keeps stratification
-    # since its labels genuinely drive the classifier fit later.
-    train_target_harm, val_target_harm = train_test_split(
-        target_harmonization, test_size=0.2, random_state=VAL_SPLIT_SEED,
-    )
+        # target's split is NOT label-stratified -- a real deployment-time
+        # unlabeled target cohort has no labels to stratify by, so
+        # stratifying here would be testing under friendlier conditions
+        # than the model will actually see. Known (source) cohorts keep
+        # stratification since their labels genuinely drive downstream
+        # training/eval elsewhere.
+        train_p, val_p = train_test_split(
+            patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
+            stratify=None if is_target else [p.label for p in patients_for_training],
+        )
+        cohort_train[name] = train_p
+        cohort_val[name] = val_p
 
     torch.manual_seed(torch_seed)
     model = HarmonizationModel(latent_dim=64)
-    model = train_harmonization(
+
+    # -- stage 1-2: pure recon+MMD, no classification signal yet ------------
+    model = train_harmonization_shared(
         model,
-        train_cohorts={"known": train_known, "target": train_target_harm},
-        val_cohorts={"known": val_known, "target": val_target_harm},
+        cohort_train=cohort_train, cohort_val=cohort_val,
         n_epochs=N_EPOCHS,
         lambda_mmd=LAMBDA_MMD,
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
+        target_cohort=target_cohort,
+        target_pair_weight=TARGET_PAIR_WEIGHT,
+        pair_weighting=PAIR_WEIGHTING,
+        weighting_ema_beta=WEIGHTING_EMA_BETA,
+        weighting_temperature=WEIGHTING_TEMPERATURE,
+        weighting_floor=WEIGHTING_FLOOR,
+        weighting_ceil=WEIGHTING_CEIL,
         checkpoint_path=None,
         patience=PATIENCE,
     )
-    return model, all_cohorts, target_harmonization, target_heldout
+
+    # -- alternating fine-tune: fit-classifier / train-encoder, repeat ------
+    model = alternating_classifier_finetune_shared(
+        model,
+        cohort_train=cohort_train, cohort_val=cohort_val,
+        target_cohort=target_cohort,
+        n_rounds=ALT_N_ROUNDS,
+        epochs_per_round=ALT_EPOCHS_PER_ROUND,
+        lambda_mmd=ALT_LAMBDA_MMD,
+        lr=ALT_LR,
+        target_pair_weight=TARGET_PAIR_WEIGHT,
+        pair_weighting=PAIR_WEIGHTING,
+        weighting_ema_beta=WEIGHTING_EMA_BETA,
+        weighting_temperature=WEIGHTING_TEMPERATURE,
+        weighting_floor=WEIGHTING_FLOOR,
+        weighting_ceil=WEIGHTING_CEIL,
+        checkpoint_path=None,
+    )
+
+    return model, cohort_all, target_harmonization, target_heldout
 
 
 def evaluate_target(
@@ -231,37 +269,32 @@ def evaluate_target(
     target_harmonization: list,
     target_heldout: list,
 ) -> dict:
-    """Fit the classifier on the known (non-target) cohorts' LABELS and
-    evaluate on target's held-out half -- never seen by the harmonization
-    model (train_harmonization only saw target_harmonization) or the
-    classifier (only ever sees known_patients).
+    """No downstream classifier fit here anymore -- every probability
+    below comes straight from model.aux_clf via predict_probs. z-score
+    correction still references the pooled known cohorts' own aux_clf
+    output distribution, same principle as before, just sourced from
+    aux_clf instead of a separately-fit LogisticRegression.
     """
     known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
     known_patients = [p for name in known_cohorts for p in cohort_all[name]]
 
-    Z_known, y_known = encode_patients(model, known_patients)
-    clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))
-    clf.fit(Z_known, y_known)
-
-    target_patients = target_heldout
+    prob_known, y_known = predict_probs(model, known_patients)
+    prob_harm, y_harm = predict_probs(model, target_harmonization)
+    prob_target, y_target = predict_probs(model, target_heldout)
 
     # -- z-score correction: align target's predicted-probability ---
-    # distribution to the POOLED known cohorts' -- exactly the data clf
-    # was fit on. Never uses target's own labels, same principle as the
-    # 2-cohort script's use of zscore_shift_correct.
-    Z_target, _ = encode_patients(model, target_patients)
-    prob_known = clf.predict_proba(Z_known)[:, 1]
-    prob_target = clf.predict_proba(Z_target)[:, 1]
+    # distribution to the POOLED known cohorts' -- exactly the data
+    # aux_clf was fit on. Never uses target's own labels either way.
     prob_target_corrected = zscore_shift_correct(prob_source=prob_known, prob_target=prob_target)
 
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
         "known_cohorts": known_cohorts,
-        "known_cohort_insample": eval_set(model, clf, known_patients),
-        "target_cohort_harmonization_half": eval_set(model, clf, target_harmonization),
-        "target_cohort_raw": eval_set(model, clf, target_patients),
-        "target_cohort_corrected": eval_set(model, clf, target_patients, prob_override=prob_target_corrected),
+        "known_cohort_insample": eval_on(y_known, prob_known),
+        "target_cohort_harmonization_half": eval_on(y_harm, prob_harm),
+        "target_cohort_raw": eval_on(y_target, prob_target),
+        "target_cohort_corrected": eval_on(y_target, prob_target_corrected),
     }
 
 
@@ -307,6 +340,8 @@ if __name__ == "__main__":
     print(f"data path    : {data_path}")
     print(f"results path : {results_path}")
     print(f"cohorts      : {COHORT_NAMES}")
+    print(f"alt fine-tune: {ALT_N_ROUNDS} rounds x {ALT_EPOCHS_PER_ROUND} epochs  "
+          f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}")
 
     all_cohorts = load_all_cohorts(data_path)
     for name in COHORT_NAMES:
