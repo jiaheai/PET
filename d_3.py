@@ -727,7 +727,7 @@ if __name__ == "__main__":
         cohort_val[name] = val_p
         print(f"{name:12s}: {len(train_p)} train / {len(val_p)} val  (all {len(patients)} used)")
     torch.manual_seed(41)
-    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
+    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=16)
     checkpoint_name = f"best_harmonization_multi_target-{TARGET_COHORT or 'none'}.pt"
     model = train_harmonization_multi(
         model,
