@@ -1,27 +1,35 @@
 """
 FINAL EVALUATION script. Reports numbers ONLY on the target cohort's
-TRULY held-out half (never touches training, never touches
-tune_sweep_multi.py's harmonization-half tuning signal). Companion to
-tune_sweep_multi.py, which shares the exact same TARGET_HOLDOUT_SEED so
-both scripts split each target cohort identically -- this one just
-evaluates on the complementary half tune_sweep_multi.py never looks at.
+TRULY held-out half. Loads already-trained checkpoints from --model-dir
+(produced by tune_sweep_multi.py's --output-dir) instead of retraining --
+same exact weights that were tuned get the held-out check, no risk of a
+re-trained clone differing due to nondeterminism (cudnn, sampler
+ordering -- torch.manual_seed alone doesn't guarantee bit-identical
+retraining), and no need to pay the training cost a second time.
+
+Companion to tune_sweep_multi.py, which shares the exact same
+TARGET_HOLDOUT_SEED so both scripts split each target cohort identically
+-- this one evaluates on the complementary half tune_sweep_multi.py never
+looks at. Since target_heldout depends only on TARGET_HOLDOUT_SEED and
+target_cohort (not on torch_seed), no train/val reconstruction is needed
+here at all -- this script never touches cohort_train/cohort_val, only
+the full per-cohort patient lists straight from load_all_cohorts.
 
 Intended usage: iterate on hyperparameters using tune_sweep_multi.py
 (harmonization-half signal, safe to look at repeatedly) until a config is
-locked in. Then run THIS script ONCE with that config and report whatever
-it says. Don't come back and keep tuning after seeing this result -- using
-target_heldout to pick between configs (even informally, even just
+locked in. Then run THIS script ONCE against the resulting --output-dir
+checkpoints and report whatever it says. Don't come back, retune, rerun
+tune_sweep_multi.py to overwrite the checkpoints, and check here again --
+using target_heldout to pick between configs (even informally, even just
 "that one scored better so let's keep it") is the exact leakage this
 split exists to prevent. If the number disappoints, the honest response
 is to note it, not to try another config and re-check.
 
-Per (seed, target_cohort): train stages 1-2 (train_harmonization_multi,
-lambda_clf=0 -- pure recon+MMD, no classification signal yet), then hand
-the harmonized model to alternating_classifier_finetune, which alternates
-between fitting a full sklearn LogisticRegression on the current z and
-training the encoders against that frozen fit (MMD still active every
-round). After that returns, model.aux_clf already IS the classifier to
-use -- evaluate_target reads it directly, no separate downstream refit.
+If a checkpoint is missing for a (seed, target_cohort) this script needs,
+it raises a clear error telling you to run tune_sweep_multi.py first --
+it does NOT fall back to training from scratch, on purpose, so this
+script can't silently drift from whatever config actually produced the
+checkpoints.
 """
 
 from __future__ import annotations
@@ -35,54 +43,32 @@ import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from d_3 import (
-    HarmonizationModel,
-    train_harmonization_multi,
-    alternating_classifier_finetune,
-)
+from d_3 import HarmonizationModel
 from nifti_loader import load_all_cohorts
 
 DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "heldout_sweep_multi_results.jsonl"
+DEFAULT_MODEL_DIR    = "models_tuned"   # matches tune_sweep_multi.py's DEFAULT_OUTPUT_DIR
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
 TORCH_SEEDS    = list(range(25))
-VAL_SPLIT_SEED = 40
 TARGET_HOLDOUT_SEED = 123   # SAME value as tune_sweep_multi.py -- both
                              # scripts split each target cohort identically
-
-# -- stage 1-2 (harmonization) settings -- KEEP IN SYNC with whatever ------
-# config tune_sweep_multi.py landed on. This script doesn't import those
-# constants from tune_sweep_multi.py on purpose (keeps the two scripts
-# fully independent, no accidental coupling) -- copy the locked-in values
-# over by hand once tuning is done.
-N_EPOCHS       = 1000
-LAMBDA_MMD     = 100
-LATENT_GAMMA_MODE = "adaptive"
-DECODER_FREEZE_EPOCH = 50
-PATIENCE = 50   # only counts post-freeze, see train_harmonization_multi's patience_active gate
-
-# -- alternating fine-tune settings ------------------------------------------
-ALT_N_ROUNDS        = 5
-ALT_EPOCHS_PER_ROUND = 10
-ALT_LAMBDA_MMD       = 100
-ALT_LR               = 1e-4
-
-# -- adaptive pair weighting --------------------------------------------
-PAIR_WEIGHTING       = "adaptive"
-TARGET_PAIR_WEIGHT   = 1.0
-WEIGHTING_EMA_BETA    = 0.9
-WEIGHTING_TEMPERATURE = 1.5
-WEIGHTING_FLOOR       = 1e-3
-WEIGHTING_CEIL        = 10.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="FINAL EVALUATION sweep -- held-out numbers only. Run once, after tuning is locked in."
+        description="FINAL EVALUATION sweep -- held-out numbers only, loads pre-trained "
+                    "checkpoints. Run once, after tuning is locked in."
     )
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH)
     parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
+    parser.add_argument(
+        "--model-dir", default=DEFAULT_MODEL_DIR,
+        help=f"Directory to load trained checkpoints from, produced by tune_sweep_multi.py's "
+             f"--output-dir (default: {DEFAULT_MODEL_DIR}). Expects "
+             f"seed{{N}}_target{{NAME}}.pt for every (seed, target_cohort) this run needs.",
+    )
     parser.add_argument(
         "--fresh", action="store_true",
         help="Wipe --results-path and rerun every seed from scratch. Default: resume.",
@@ -122,6 +108,10 @@ def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
     for r in runs:
         by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
     return {seed for seed, cohorts in by_seed.items() if cohorts == set(cohort_names)}
+
+
+def checkpoint_path_for(model_dir: Path, torch_seed: int, target_cohort: str) -> Path:
+    return model_dir / f"seed{torch_seed}_target{target_cohort}.pt"
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
@@ -178,72 +168,30 @@ def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict |
     }
 
 
-def train_model_once(
-    torch_seed: int, all_cohorts: dict, target_cohort: str
+def load_model_once(
+    torch_seed: int, all_cohorts: dict, target_cohort: str, model_dir: Path,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[HarmonizationModel, dict, list]:
-    target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
+    """Loads a checkpoint tune_sweep_multi.py already trained -- no
+    training happens here. target_heldout depends only on
+    TARGET_HOLDOUT_SEED and target_cohort's full patient list (not on
+    torch_seed, not on any train/val split), so it's cheap to recompute
+    here without needing cohort_train/cohort_val at all.
+    """
+    _, target_heldout = split_target_cohort(all_cohorts[target_cohort])
 
-    cohort_train, cohort_val, cohort_all = {}, {}, {}
-    for name in COHORT_NAMES:
-        cohort_all[name] = all_cohorts[name]
-        is_target = name == target_cohort
-        patients_for_training = target_harmonization if is_target else all_cohorts[name]
-
-        # target's split is NOT label-stratified -- a real deployment-time
-        # unlabeled target cohort has no labels to stratify by, so
-        # stratifying here would be testing under friendlier conditions
-        # than the model will actually see. Known (source) cohorts keep
-        # stratification since their labels genuinely drive lambda_clf
-        # (during the alternating fine-tune) and the classifier fit.
-        train_p, val_p = train_test_split(
-            patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
-            stratify=None if is_target else [p.label for p in patients_for_training],
+    ckpt_path = checkpoint_path_for(model_dir, torch_seed, target_cohort)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"no checkpoint at {ckpt_path} -- run tune_sweep_multi.py with "
+            f"--output-dir {model_dir} first (seed={torch_seed}, target_cohort={target_cohort!r})"
         )
-        cohort_train[name] = train_p
-        cohort_val[name] = val_p
 
-    torch.manual_seed(torch_seed)
     model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+    model = model.to(device)
 
-    # -- stage 1-2: pure recon+MMD, no classification signal yet ------------
-    model = train_harmonization_multi(
-        model,
-        cohort_train=cohort_train, cohort_val=cohort_val,
-        n_epochs=N_EPOCHS,
-        lambda_mmd=LAMBDA_MMD,
-        lambda_clf=0.0,
-        decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
-        latent_gamma_mode=LATENT_GAMMA_MODE,
-        target_cohort=target_cohort,
-        target_pair_weight=TARGET_PAIR_WEIGHT,
-        pair_weighting=PAIR_WEIGHTING,
-        weighting_ema_beta=WEIGHTING_EMA_BETA,
-        weighting_temperature=WEIGHTING_TEMPERATURE,
-        weighting_floor=WEIGHTING_FLOOR,
-        weighting_ceil=WEIGHTING_CEIL,
-        checkpoint_path=None,
-        patience=PATIENCE,
-    )
-
-    # -- alternating fine-tune: fit-classifier / train-encoders, repeat -----
-    model = alternating_classifier_finetune(
-        model,
-        cohort_train=cohort_train, cohort_val=cohort_val,
-        target_cohort=target_cohort,
-        n_rounds=ALT_N_ROUNDS,
-        epochs_per_round=ALT_EPOCHS_PER_ROUND,
-        lambda_mmd=ALT_LAMBDA_MMD,
-        lr=ALT_LR,
-        target_pair_weight=TARGET_PAIR_WEIGHT,
-        pair_weighting=PAIR_WEIGHTING,
-        weighting_ema_beta=WEIGHTING_EMA_BETA,
-        weighting_temperature=WEIGHTING_TEMPERATURE,
-        weighting_floor=WEIGHTING_FLOOR,
-        weighting_ceil=WEIGHTING_CEIL,
-        checkpoint_path=None,
-    )
-
-    return model, cohort_all, target_heldout
+    return model, all_cohorts, target_heldout
 
 
 def evaluate_target(
@@ -310,13 +258,20 @@ if __name__ == "__main__":
     args = parse_args()
     data_path = Path(args.data_path)
     results_path = Path(args.results_path)
+    model_dir = Path(args.model_dir)
 
-    print(f"[FINAL EVALUATION -- held-out numbers only. Run this ONCE per locked config.]")
+    print(f"[FINAL EVALUATION -- held-out numbers only, loading pre-trained checkpoints. "
+          f"Run this ONCE per locked config.]")
     print(f"data path    : {data_path}")
     print(f"results path : {results_path}")
+    print(f"model dir    : {model_dir}  (loading checkpoints from here, NOT training)")
     print(f"cohorts      : {COHORT_NAMES}")
-    print(f"alt fine-tune: {ALT_N_ROUNDS} rounds x {ALT_EPOCHS_PER_ROUND} epochs  "
-          f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}")
+
+    if not model_dir.exists():
+        raise FileNotFoundError(
+            f"--model-dir {model_dir} does not exist -- run tune_sweep_multi.py with "
+            f"--output-dir {model_dir} first"
+        )
 
     all_cohorts = load_all_cohorts(data_path)
     for name in COHORT_NAMES:
@@ -348,9 +303,9 @@ if __name__ == "__main__":
     for torch_seed in seeds_to_run:
         for target_cohort in COHORT_NAMES:
             print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
-                  f"(50% of {target_cohort} in training, 50% TRULY held out)\n{'='*60}")
-            model, cohort_all, target_heldout = train_model_once(
-                torch_seed, all_cohorts, target_cohort
+                  f"(loading checkpoint, evaluating on TRULY held-out half)\n{'='*60}")
+            model, cohort_all, target_heldout = load_model_once(
+                torch_seed, all_cohorts, target_cohort, model_dir
             )
 
             print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} "
@@ -379,5 +334,6 @@ if __name__ == "__main__":
     for s in summary_stats:
         append_summary(s, results_path)
     print(f"\nsummary appended to: {results_path}")
-    print(f"\n[this is the reportable number -- if you're about to tune further "
-          f"and re-run this, stop: that's the leakage this split exists to prevent]")
+    print(f"\n[this is the reportable number -- if you're about to retune and re-run "
+          f"tune_sweep_multi.py to overwrite {model_dir}, then check here again, stop: "
+          f"that's the leakage this split exists to prevent]")
