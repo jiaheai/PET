@@ -1,18 +1,19 @@
 """
-TUNING script. Reports numbers ONLY on the target cohort's harmonization
-half (never-labeled-to-the-model but seen by the encoder during
-training) and the known cohorts' in-sample performance. target_heldout is
-split off exactly like the held-out companion script (heldout_sweep_
-multi.py, SAME TARGET_HOLDOUT_SEED) but is NEVER encoded, NEVER scored,
-and NEVER appears anywhere in this script's output or results file --
-not printed, not returned, not computed at all. This isn't just a
-reporting choice: predict_probs is never called on it, so there's
-nothing to accidentally glance at while iterating on hyperparameters.
+FINAL EVALUATION script. Reports numbers ONLY on the target cohort's
+TRULY held-out half (never touches training, never touches
+tune_sweep_multi.py's harmonization-half tuning signal). Companion to
+tune_sweep_multi.py, which shares the exact same TARGET_HOLDOUT_SEED so
+both scripts split each target cohort identically -- this one just
+evaluates on the complementary half tune_sweep_multi.py never looks at.
 
-Use this script for every round of hyperparameter comparison. Once a
-config is locked in, run heldout_sweep_multi.py ONCE with that config and
-treat whatever it reports as final -- don't come back here and keep
-tuning after seeing it. See that script's docstring for why.
+Intended usage: iterate on hyperparameters using tune_sweep_multi.py
+(harmonization-half signal, safe to look at repeatedly) until a config is
+locked in. Then run THIS script ONCE with that config and report whatever
+it says. Don't come back and keep tuning after seeing this result -- using
+target_heldout to pick between configs (even informally, even just
+"that one scored better so let's keep it") is the exact leakage this
+split exists to prevent. If the number disappoints, the honest response
+is to note it, not to try another config and re-check.
 
 Per (seed, target_cohort): train stages 1-2 (train_harmonization_multi,
 lambda_clf=0 -- pure recon+MMD, no classification signal yet), then hand
@@ -42,16 +43,19 @@ from d_3 import (
 from nifti_loader import load_all_cohorts
 
 DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
-DEFAULT_RESULTS_PATH = "tune_sweep_multi_results.jsonl"
+DEFAULT_RESULTS_PATH = "heldout_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
 TORCH_SEEDS    = list(range(25))
 VAL_SPLIT_SEED = 40
-TARGET_HOLDOUT_SEED = 123   # SAME value as heldout_sweep_multi.py -- both
-                             # scripts split the target cohort identically,
-                             # this one just never looks at the held-out half
+TARGET_HOLDOUT_SEED = 123   # SAME value as tune_sweep_multi.py -- both
+                             # scripts split each target cohort identically
 
-# -- stage 1-2 (harmonization) settings -------------------------------------
+# -- stage 1-2 (harmonization) settings -- KEEP IN SYNC with whatever ------
+# config tune_sweep_multi.py landed on. This script doesn't import those
+# constants from tune_sweep_multi.py on purpose (keeps the two scripts
+# fully independent, no accidental coupling) -- copy the locked-in values
+# over by hand once tuning is done.
 N_EPOCHS       = 1000
 LAMBDA_MMD     = 100
 LATENT_GAMMA_MODE = "adaptive"
@@ -61,16 +65,10 @@ PATIENCE = 50   # only counts post-freeze, see train_harmonization_multi's patie
 # -- alternating fine-tune settings ------------------------------------------
 ALT_N_ROUNDS        = 5
 ALT_EPOCHS_PER_ROUND = 10
-ALT_LAMBDA_MMD       = 100   # MMD weight during alternating rounds -- kept equal to stage-2's
-                              # LAMBDA_MMD by default; change independently if you want to test
-                              # a different alignment strength for the fine-tune phase specifically
+ALT_LAMBDA_MMD       = 100
 ALT_LR               = 1e-4
 
-# -- adaptive pair weighting (applied in BOTH stage 1-2 and every alternating
-# round -- see train_harmonization_multi / alternating_classifier_finetune
-# docstrings for the full mechanics). "static" + target_pair_weight=1.0 is a
-# no-op, identical to having no weighting at all -- change PAIR_WEIGHTING to
-# "adaptive" to actually turn this on.
+# -- adaptive pair weighting --------------------------------------------
 PAIR_WEIGHTING       = "adaptive"
 TARGET_PAIR_WEIGHT   = 1.0
 WEIGHTING_EMA_BETA    = 0.9
@@ -81,7 +79,7 @@ WEIGHTING_CEIL        = 10.0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="TUNING sweep -- harmonization-half / in-sample numbers only, no held-out data touched"
+        description="FINAL EVALUATION sweep -- held-out numbers only. Run once, after tuning is locked in."
     )
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH)
     parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
@@ -127,10 +125,6 @@ def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
-    # heldout_half is computed here (both scripts must use the identical
-    # split so a later heldout_sweep_multi.py run evaluates on the exact
-    # same patients this script trained around) but this script NEVER
-    # passes it to predict_probs or anything else below.
     harmonization_half, heldout_half = train_test_split(
         patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
         stratify=[p.label for p in patients],
@@ -187,10 +181,7 @@ def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict |
 def train_model_once(
     torch_seed: int, all_cohorts: dict, target_cohort: str
 ) -> tuple[HarmonizationModel, dict, list]:
-    # heldout_half comes back from split_target_cohort but is discarded
-    # immediately (assigned to _) -- it's never bound to a variable this
-    # script keeps around, let alone passed anywhere.
-    target_harmonization, _ = split_target_cohort(all_cohorts[target_cohort])
+    target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
 
     cohort_train, cohort_val, cohort_all = {}, {}, {}
     for name in COHORT_NAMES:
@@ -252,7 +243,7 @@ def train_model_once(
         checkpoint_path=None,
     )
 
-    return model, cohort_all, target_harmonization
+    return model, cohort_all, target_heldout
 
 
 def evaluate_target(
@@ -260,22 +251,22 @@ def evaluate_target(
     model: HarmonizationModel,
     cohort_all: dict,
     target_cohort: str,
-    target_harmonization: list,
+    target_heldout: list,
 ) -> dict:
-    """No target_heldout parameter at all -- can't accidentally score it
-    here even by mistake, since this function was never given it."""
+    """No target_harmonization parameter -- this script only ever scores
+    the held-out half, nothing else about the target cohort."""
     known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
     known_patients = [p for name in known_cohorts for p in cohort_all[name]]
 
     prob_known, y_known = predict_probs(model, known_patients)
-    prob_harm, y_harm = predict_probs(model, target_harmonization)
+    prob_target, y_target = predict_probs(model, target_heldout)
 
     return {
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
         "known_cohorts": known_cohorts,
         "known_cohort_insample": eval_on(y_known, prob_known),
-        "target_cohort_harmonization_half": eval_on(y_harm, prob_harm),
+        "target_cohort_heldout": eval_on(y_target, prob_target),
     }
 
 
@@ -320,7 +311,7 @@ if __name__ == "__main__":
     data_path = Path(args.data_path)
     results_path = Path(args.results_path)
 
-    print(f"[TUNING RUN -- harmonization-half / in-sample only, held-out data never touched]")
+    print(f"[FINAL EVALUATION -- held-out numbers only. Run this ONCE per locked config.]")
     print(f"data path    : {data_path}")
     print(f"results path : {results_path}")
     print(f"cohorts      : {COHORT_NAMES}")
@@ -357,20 +348,20 @@ if __name__ == "__main__":
     for torch_seed in seeds_to_run:
         for target_cohort in COHORT_NAMES:
             print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
-                  f"(50% of {target_cohort} in training -- other 50% split off but NEVER used here)\n{'='*60}")
-            model, cohort_all, target_harmonization = train_model_once(
+                  f"(50% of {target_cohort} in training, 50% TRULY held out)\n{'='*60}")
+            model, cohort_all, target_heldout = train_model_once(
                 torch_seed, all_cohorts, target_cohort
             )
 
             print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} "
-                  f"(in-training: {len(target_harmonization)}) ---")
+                  f"(held out: {len(target_heldout)}) ---")
             r = evaluate_target(
-                torch_seed, model, cohort_all, target_cohort, target_harmonization
+                torch_seed, model, cohort_all, target_cohort, target_heldout
             )
             append_result(r, results_path)
             results.append(r)
-            print(f"  known cohorts (in-sample)      : {r['known_cohort_insample']}")
-            print(f"  {target_cohort} (harmonization half) : {r['target_cohort_harmonization_half']}")
+            print(f"  known cohorts (in-sample)  : {r['known_cohort_insample']}")
+            print(f"  {target_cohort} (held out)  : {r['target_cohort_heldout']}")
 
     summary_stats = []
     for target_cohort in COHORT_NAMES:
@@ -378,15 +369,15 @@ if __name__ == "__main__":
         if not subset:
             continue
         summary_stats.append(summarize(
-            subset, "target_cohort_harmonization_half", f"target={target_cohort} (harmonization half)"
+            subset, "target_cohort_heldout", f"target={target_cohort} (held-out)"
         ))
 
     summary_stats.append(summarize(
-        results, "target_cohort_harmonization_half", "ALL target cohorts pooled (harmonization half)"
+        results, "target_cohort_heldout", "ALL target cohorts pooled (held-out)"
     ))
 
     for s in summary_stats:
         append_summary(s, results_path)
     print(f"\nsummary appended to: {results_path}")
-    print(f"\n[remember: this is the TUNING signal, not a reported result -- "
-          f"run heldout_sweep_multi.py once, at the end, for the real number]")
+    print(f"\n[this is the reportable number -- if you're about to tune further "
+          f"and re-run this, stop: that's the leakage this split exists to prevent]")
