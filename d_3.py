@@ -29,10 +29,12 @@ class Encoder3D(nn.Module):
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
         )
+        self.dropout = nn.Dropout3d(p=0.2)
         self.fc = nn.Linear(64 * 4 * 4 * 4, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv(x)
+        h = self.dropout(h)
         h = h.flatten(start_dim=1)
         return self.fc(h)
 

@@ -22,7 +22,7 @@ DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "tune_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(15))
+TORCH_SEEDS    = list(range(25))
 VAL_SPLIT_SEED = 40
 TARGET_HOLDOUT_SEED = 123  # Must match heldout_sweep_multi.py.
 
