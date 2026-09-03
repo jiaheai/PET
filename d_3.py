@@ -68,6 +68,7 @@ class HarmonizationModel(nn.Module):
         self.cohort_names = list(cohort_names)
         self.encoders = nn.ModuleDict({name: Encoder3D(latent_dim) for name in cohort_names})
         self.decoder = Decoder3D(latent_dim)
+        self.clf_dropout = nn.Dropout(p=0.2)
         self.aux_clf = nn.Linear(latent_dim, 1)
 
     def encode(self, cohort_name: str, x: torch.Tensor) -> torch.Tensor:
@@ -79,8 +80,7 @@ class HarmonizationModel(nn.Module):
         return x_hat, z
 
     def classify(self, z: torch.Tensor) -> torch.Tensor:
-
-
+        z = self.clf_dropout(z)
         return self.aux_clf(z).squeeze(-1)
 
     def set_decoder_trainable(self, trainable: bool) -> None:
@@ -727,7 +727,7 @@ if __name__ == "__main__":
         cohort_val[name] = val_p
         print(f"{name:12s}: {len(train_p)} train / {len(val_p)} val  (all {len(patients)} used)")
     torch.manual_seed(41)
-    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=16)
+    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=32)
     checkpoint_name = f"best_harmonization_multi_target-{TARGET_COHORT or 'none'}.pt"
     model = train_harmonization_multi(
         model,
