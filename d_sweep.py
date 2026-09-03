@@ -1,53 +1,4 @@
-"""
-TUNING script. Reports numbers ONLY on the target cohort's harmonization
-half (never-labeled-to-the-model but seen by the encoder during
-training) and the known cohorts' in-sample performance. target_heldout is
-split off exactly like the held-out companion script (heldout_sweep_
-multi.py, SAME TARGET_HOLDOUT_SEED) but is NEVER encoded, NEVER scored,
-and NEVER appears anywhere in this script's output or results file --
-not printed, not returned, not computed at all. This isn't just a
-reporting choice: predict_probs is never called on it, so there's
-nothing to accidentally glance at while iterating on hyperparameters.
-
-Checkpoint I/O -- --load-dir and --output-dir are INDEPENDENT flags, not
-a single shared directory:
-
-    neither flag              -> always train, never load, never save
-    --load-dir X only         -> load from X when a checkpoint exists
-                                  there, else train; nothing is saved
-    --output-dir Y only       -> always train (never loads), save every
-                                  freshly-trained model to Y
-    --load-dir X --output-dir Y -> load from X when available, else
-                                  train; only FRESHLY TRAINED models get
-                                  saved to Y (a model loaded from X is
-                                  not re-saved to Y)
-
-This means --output-dir alone does NOT give you free resume-by-checkpoint
-across separate invocations -- run it twice with only --output-dir and it
-retrains and overwrites everything both times. If you want "don't retrain
-what's already on disk," pass the SAME path as both --load-dir and
---output-dir explicitly.
-
---fresh only wipes --results-path and reruns every seed's EVALUATION from
-scratch -- it does NOT touch checkpoint loading. If --load-dir has a
-matching checkpoint, --fresh still loads it rather than retraining; the
-two flags are fully independent. If you want to force retraining, don't
-pass --load-dir (or point it at an empty/different directory).
-
-Once a config is locked in, run heldout_sweep_multi.py once against
-whatever --output-dir you saved to -- same exact weights get the
-held-out check, not a re-trained clone that could differ due to
-nondeterminism (cudnn, sampler ordering -- torch.manual_seed alone
-doesn't guarantee bit-identical retraining).
-
-Per (seed, target_cohort): train stages 1-2 (train_harmonization_multi,
-lambda_clf=0 -- pure recon+MMD, no classification signal yet), then hand
-the harmonized model to alternating_classifier_finetune, which alternates
-between fitting a full sklearn LogisticRegression on the current z and
-training the encoders against that frozen fit (MMD still active every
-round). After that returns, model.aux_clf already IS the classifier to
-use -- evaluate_target reads it directly, no separate downstream refit.
-"""
+"""Tune on the target harmonization half only; the held-out half is never scored. Loading requires --load-dir, saving requires --output-dir, and --fresh only resets results."""
 
 from __future__ import annotations
 
@@ -71,32 +22,26 @@ DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
 DEFAULT_RESULTS_PATH = "tune_sweep_multi_results.jsonl"
 
 COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(5))
+TORCH_SEEDS    = list(range(15))
 VAL_SPLIT_SEED = 40
-TARGET_HOLDOUT_SEED = 123   # SAME value as heldout_sweep_multi.py -- both
-                             # scripts split the target cohort identically,
-                             # this one just never looks at the held-out half
+TARGET_HOLDOUT_SEED = 123  # Must match heldout_sweep_multi.py.
 
-# -- stage 1-2 (harmonization) settings -------------------------------------
+
 N_EPOCHS       = 1000
 LAMBDA_MMD     = 100
 LATENT_GAMMA_MODE = "adaptive"
 DECODER_FREEZE_EPOCH = 50
-PATIENCE = 50   # only counts post-freeze, see train_harmonization_multi's patience_active gate
+PATIENCE = 50
 
-# -- alternating fine-tune settings ------------------------------------------
+
 ALT_N_ROUNDS        = 5
 ALT_EPOCHS_PER_ROUND = 10
-ALT_LAMBDA_MMD       = 100   # MMD weight during alternating rounds -- kept equal to stage-2's
-                              # LAMBDA_MMD by default; change independently if you want to test
-                              # a different alignment strength for the fine-tune phase specifically
+ALT_LAMBDA_MMD       = 100
+
+
 ALT_LR               = 1e-4
 
-# -- adaptive pair weighting (applied in BOTH stage 1-2 and every alternating
-# round -- see train_harmonization_multi / alternating_classifier_finetune
-# docstrings for the full mechanics). "static" + target_pair_weight=1.0 is a
-# no-op, identical to having no weighting at all -- change PAIR_WEIGHTING to
-# "adaptive" to actually turn this on.
+
 PAIR_WEIGHTING        = "adaptive"
 TARGET_PAIR_WEIGHT    = 1.0
 WEIGHTING_EMA_BETA    = 0.9
@@ -113,18 +58,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
     parser.add_argument(
         "--load-dir", default=None,
-        help="Directory to load existing checkpoints from, if present (seed{N}_target{NAME}.pt). "
-             "Independent of --output-dir -- see module docstring for the four combinations.",
+        help="Optional directory to load existing model checkpoints from. "
+             "If omitted, models are never loaded from disk.",
     )
     parser.add_argument(
         "--output-dir", default=None,
-        help="Directory to save freshly-trained checkpoints to. Only models trained THIS run "
-             "are saved -- a model loaded via --load-dir is not re-saved here.",
+        help="Optional directory to save newly trained model checkpoints to. "
+             "If omitted, trained models are not saved.",
     )
     parser.add_argument(
         "--fresh", action="store_true",
-        help="Wipe --results-path and rerun every seed's evaluation from scratch. Does NOT "
-             "affect --load-dir -- a matching checkpoint is still loaded even with --fresh.",
+        help="Wipe --results-path and rerun every seed from scratch. "
+             "Checkpoint loading is controlled independently by --load-dir.",
     )
     return parser.parse_args()
 
@@ -168,10 +113,8 @@ def checkpoint_path_for(directory: Path, torch_seed: int, target_cohort: str) ->
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
-    # heldout_half is computed here (both scripts must use the identical
-    # split so a later heldout_sweep_multi.py run evaluates on the exact
-    # same patients this script trained around) but this script NEVER
-    # passes it to predict_probs or anything else below.
+
+
     harmonization_half, heldout_half = train_test_split(
         patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
         stratify=[p.label for p in patients],
@@ -184,12 +127,7 @@ def predict_probs(
     patients: list,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Same as b_sweep_multi.py's predict_probs -- reads straight from
-    model.aux_clf. After alternating_classifier_finetune, aux_clf holds a
-    real, fully-converged sklearn fit (folded into linear-layer form), not
-    a jointly-SGD-trained proxy -- so this is exactly the classifier that
-    was used throughout the fine-tune, not a stand-in for it.
-    """
+    """Predict with the LR weights stored in model.aux_clf."""
     model = model.to(device)
     model.eval()
     probs, ys = [], []
@@ -228,10 +166,9 @@ def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict |
 def train_model_once(
     torch_seed: int, all_cohorts: dict, target_cohort: str
 ) -> tuple[HarmonizationModel, dict, list]:
-    # heldout_half comes back from split_target_cohort but is discarded
-    # immediately (assigned to _) -- it's never bound to a variable this
-    # script keeps around, let alone passed anywhere.
-    target_harmonization, _ = split_target_cohort(all_cohorts[target_cohort])
+
+
+    target_harmonization, _ = split_target_cohort(all_cohorts[target_cohort])  # Held-out half discarded.
 
     cohort_train, cohort_val, cohort_all = {}, {}, {}
     for name in COHORT_NAMES:
@@ -239,12 +176,7 @@ def train_model_once(
         is_target = name == target_cohort
         patients_for_training = target_harmonization if is_target else all_cohorts[name]
 
-        # target's split is NOT label-stratified -- a real deployment-time
-        # unlabeled target cohort has no labels to stratify by, so
-        # stratifying here would be testing under friendlier conditions
-        # than the model will actually see. Known (source) cohorts keep
-        # stratification since their labels genuinely drive lambda_clf
-        # (during the alternating fine-tune) and the classifier fit.
+
         train_p, val_p = train_test_split(
             patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
             stratify=None if is_target else [p.label for p in patients_for_training],
@@ -255,13 +187,12 @@ def train_model_once(
     torch.manual_seed(torch_seed)
     model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
 
-    # -- stage 1-2: pure recon+MMD, no classification signal yet ------------
+
     model = train_harmonization_multi(
         model,
         cohort_train=cohort_train, cohort_val=cohort_val,
         n_epochs=N_EPOCHS,
         lambda_mmd=LAMBDA_MMD,
-        lambda_clf=0.0,
         decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
         latent_gamma_mode=LATENT_GAMMA_MODE,
         target_cohort=target_cohort,
@@ -275,7 +206,7 @@ def train_model_once(
         patience=PATIENCE,
     )
 
-    # -- alternating fine-tune: fit-classifier / train-encoders, repeat -----
+
     model = alternating_classifier_finetune(
         model,
         cohort_train=cohort_train, cohort_val=cohort_val,
@@ -300,17 +231,10 @@ def get_or_train_model(
     torch_seed: int,
     all_cohorts: dict,
     target_cohort: str,
-    load_dir: Path | None,
+    load_dir: Path | None = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[HarmonizationModel, dict, list, bool]:
-    """Loads from load_dir only if load_dir was given and a matching
-    checkpoint exists there. Otherwise trains. --fresh does NOT affect
-    this -- it only controls results-path resume (see module docstring);
-    --load-dir is honored exactly the same whether or not --fresh was
-    passed. Returns (model, cohort_all, target_harmonization, was_loaded);
-    was_loaded=True means no training happened and nothing should be
-    (re-)saved by the caller.
-    """
+    """Load only from an explicit load_dir; otherwise train."""
     target_harmonization, _ = split_target_cohort(all_cohorts[target_cohort])
     cohort_all = {name: all_cohorts[name] for name in COHORT_NAMES}
 
@@ -322,9 +246,12 @@ def get_or_train_model(
             model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
             model = model.to(device)
             return model, cohort_all, target_harmonization, True
-        print(f"  no checkpoint at {ckpt_path} -- training")
+        else:
+            print(f"  no checkpoint at {ckpt_path} -- training")
 
-    model, cohort_all, target_harmonization = train_model_once(torch_seed, all_cohorts, target_cohort)
+    model, cohort_all, target_harmonization = train_model_once(
+        torch_seed, all_cohorts, target_cohort
+    )
     return model, cohort_all, target_harmonization, False
 
 
@@ -335,8 +262,7 @@ def evaluate_target(
     target_cohort: str,
     target_harmonization: list,
 ) -> dict:
-    """No target_heldout parameter at all -- can't accidentally score it
-    here even by mistake, since this function was never given it."""
+    """Evaluate known cohorts and the target harmonization half only."""
     known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
     known_patients = [p for name in known_cohorts for p in cohort_all[name]]
 
@@ -401,8 +327,8 @@ if __name__ == "__main__":
     print(f"[TUNING RUN -- harmonization-half / in-sample only, held-out data never touched]")
     print(f"data path    : {data_path}")
     print(f"results path : {results_path}")
-    print(f"load dir     : {load_dir if load_dir is not None else '(none -- always training)'}")
-    print(f"output dir   : {output_dir if output_dir is not None else '(none -- not saving)'}")
+    print(f"load dir     : {load_dir if load_dir is not None else '(none)'}")
+    print(f"output dir   : {output_dir if output_dir is not None else '(none)'}")
     print(f"cohorts      : {COHORT_NAMES}")
     print(f"alt fine-tune: {ALT_N_ROUNDS} rounds x {ALT_EPOCHS_PER_ROUND} epochs  "
           f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}")
@@ -439,12 +365,14 @@ if __name__ == "__main__":
             print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
                   f"(50% of {target_cohort} in training -- other 50% split off but NEVER used here)\n{'='*60}")
             model, cohort_all, target_harmonization, was_loaded = get_or_train_model(
-                torch_seed, all_cohorts, target_cohort,
+                torch_seed,
+                all_cohorts,
+                target_cohort,
                 load_dir=load_dir,
             )
 
             if was_loaded:
-                print(f"  using loaded checkpoint (not re-saved)")
+                print("  using loaded checkpoint")
             elif output_dir is not None:
                 ckpt_path = checkpoint_path_for(output_dir, torch_seed, target_cohort)
                 torch.save(model.state_dict(), ckpt_path)
@@ -475,8 +403,12 @@ if __name__ == "__main__":
 
     for s in summary_stats:
         append_summary(s, results_path)
+
     print(f"\nsummary appended to: {results_path}")
+
     if output_dir is not None:
-        print(f"checkpoints saved under: {output_dir}")
-    print(f"\n[remember: this is the TUNING signal, not a reported result -- "
-          f"run heldout_sweep_multi.py once against your saved checkpoints for the real number]")
+        print(f"new checkpoints saved under: {output_dir}")
+        print(f"\n[remember: this is the TUNING signal, not a reported result -- "
+              f"run heldout_sweep_multi.py once against these checkpoints for the real number]")
+    else:
+        print("checkpoint saving disabled (no --output-dir provided)")
