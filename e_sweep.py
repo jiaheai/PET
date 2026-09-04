@@ -1,50 +1,3 @@
-"""
-Leave-one-cohort-out sweep using the alternating block-coordinate
-fine-tune (harmonization_stratified.alternating_classifier_finetune)
-instead of aux_clf trained jointly by SGD the whole time.
-
-SKIP_STAGE2 toggles between two pipeline structures:
-
-  SKIP_STAGE2 = False (original, 3-stage):
-    stage 1 (train_harmonization_multi, epochs 0..DECODER_FREEZE_EPOCH,
-    pure recon, MMD/clf both off) -> stage 2 (same function continues,
-    decoder frozen, MMD+clf on, N_EPOCHS total) -> stage 3
-    (alternating_classifier_finetune: fit classifier / train encoders,
-    repeat).
-
-  SKIP_STAGE2 = True (2-stage): stage 1 only (train_harmonization_multi,
-    decoder_freeze_epoch=None, lambda_mmd=0.0 -- pure recon, patience/
-    early-stopping ACTIVE from epoch 0) -> decoder frozen explicitly ->
-    straight to alternating_classifier_finetune. No dedicated MMD-only
-    stage 2 at all; alignment pressure only ever comes from alternating's
-    own per-round MMD term.
-
-    Mechanical note: train_harmonization_multi has no "run pure recon and
-    stop" mode built in. Passing decoder_freeze_epoch=None makes
-    patience_active (= decoder_freeze_epoch is None or mmd_active) true
-    from epoch 0, so early stopping and best-checkpoint tracking actually
-    function during this phase -- passing lambda_mmd=0.0 as the literal
-    value (NOT the LAMBDA_MMD constant) keeps the loss pure-recon despite
-    decoder_freeze_epoch=None making lambda_mmd_t = lambda_mmd immediately
-    rather than staged to 0. An earlier version of this used
-    n_epochs == decoder_freeze_epoch to suppress the MMD-on transition
-    instead -- that also suppressed patience_active as an unwanted side
-    effect (mmd_active never flips true either way), so a 300-epoch
-    diagnostic run trained the full budget with zero early stopping and
-    massively overfit (train recon 0.36 vs val recon 5.37 at epoch 299).
-    This version fixes that: DECODER_FREEZE_EPOCH is now a max-epochs CAP
-    for stage 1, not a forced full run -- patience should stop it earlier
-    once val recon stops improving. alternating_classifier_finetune
-    assumes an already-frozen decoder (per its own docstring) but never
-    freezes it itself -- in the 3-stage path that's stage 2's job; in the
-    2-stage path train_model_once freezes it explicitly right before
-    calling alternating.
-
-Per (seed, target_cohort), after whichever pipeline runs: model.aux_clf
-already IS the classifier to use -- evaluate_target reads it directly, no
-separate downstream refit.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -56,388 +9,514 @@ import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from d_3 import (
-    HarmonizationModel,
-    train_harmonization_multi,
-    alternating_classifier_finetune,
-)
+from e import CNNClassifier3D, train_cnn_baseline
 from nifti_loader import load_all_cohorts
 
-DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
-DEFAULT_RESULTS_PATH = "e_sweep_multi_results.jsonl"
 
-COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-TORCH_SEEDS    = list(range(5))
+DEFAULT_DATA_PATH = "CUBES-Labelled-COHORTS"
+DEFAULT_RESULTS_PATH = "tune_sweep_cnn_d_matched_results.jsonl"
+
+COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
+TORCH_SEEDS = list(range(25))
 VAL_SPLIT_SEED = 40
 TARGET_HOLDOUT_SEED = 123
 
-# -- pipeline structure -------------------------------------------------
-SKIP_STAGE2 = True   # see module docstring
-
-# -- stage 1-2 (harmonization) settings -------------------------------------
-N_EPOCHS       = 1000   # only used when SKIP_STAGE2=False
-LAMBDA_MMD     = 100    # only used when SKIP_STAGE2=False -- irrelevant in
-                         # 2-stage mode since MMD never turns on in stage 1
-LATENT_GAMMA_MODE = "adaptive"
-DECODER_FREEZE_EPOCH = 100   # stage-1 (recon-only) length in BOTH modes
-PATIENCE = 50   # only counts post-freeze in 3-stage mode; active from
-                 # epoch 0 in 2-stage mode (decoder_freeze_epoch=None)
-
-# -- alternating fine-tune settings ------------------------------------------
-ALT_N_ROUNDS        = 5
-ALT_EPOCHS_PER_ROUND = 10
-ALT_LAMBDA_MMD       = 100   # MMD weight during alternating rounds -- kept equal to stage-2's
-                              # LAMBDA_MMD by default; change independently if you want to test
-                              # a different alignment strength for the fine-tune phase specifically
-ALT_LR               = 1e-4
-
-# -- adaptive pair weighting (applied in BOTH stage 1-2 and every alternating
-# round -- see train_harmonization_multi / alternating_classifier_finetune
-# docstrings for the full mechanics). "static" + target_pair_weight=1.0 is a
-# no-op, identical to having no weighting at all -- change PAIR_WEIGHTING to
-# "adaptive" to actually turn this on.
-PAIR_WEIGHTING       = "adaptive"
-TARGET_PAIR_WEIGHT   = 1.0
-WEIGHTING_EMA_BETA    = 0.9
-WEIGHTING_TEMPERATURE = 1.0
-WEIGHTING_FLOOR       = 1e-3
-WEIGHTING_CEIL        = 10.0
+LATENT_DIM = 16
+ENCODER_DROPOUT = 0.2
+CLASSIFIER_DROPOUT = 0.2
+N_EPOCHS = 200
+BATCH_SIZE = 16
+LR = 1e-3
+WEIGHT_DECAY = 1e-5
+PATIENCE = 50
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Leave-one-cohort-out sweep, alternating classifier fine-tune"
+        description="CNN baseline matched to D where applicable"
     )
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH)
     parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
-    parser.add_argument(
-        "--fresh", action="store_true",
-        help="Wipe --results-path and rerun every seed from scratch. Default: resume.",
-    )
+    parser.add_argument("--load-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--fresh", action="store_true")
     return parser.parse_args()
 
 
-def append_result(r: dict, results_path: Path) -> None:
-    r = {"record_type": "run", **r}
-    with open(results_path, "a") as f:
-        f.write(json.dumps(r) + "\n")
+def append_result(record: dict, path: Path) -> None:
+    with open(path, "a") as f:
+        f.write(json.dumps({"record_type": "run", **record}) + "\n")
 
 
-def append_summary(s: dict, results_path: Path) -> None:
-    s = {"record_type": "summary", **s}
-    with open(results_path, "a") as f:
-        f.write(json.dumps(s) + "\n")
+def append_summary(record: dict, path: Path) -> None:
+    with open(path, "a") as f:
+        f.write(json.dumps({"record_type": "summary", **record}) + "\n")
 
 
-def load_existing_results(results_path: Path) -> list[dict]:
-    if not results_path.exists():
+def load_existing_results(path: Path) -> list[dict]:
+    if not path.exists():
         return []
+
     runs = []
-    with open(results_path) as f:
+    with open(path) as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            if not line.strip():
                 continue
-            rec = json.loads(line)
-            if rec.pop("record_type", None) == "run":
-                runs.append(rec)
+            record = json.loads(line)
+            if record.pop("record_type", None) == "run":
+                runs.append(record)
     return runs
 
 
-def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
+def complete_seeds(runs: list[dict]) -> set[int]:
     by_seed: dict[int, set[str]] = {}
-    for r in runs:
-        by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
-    return {seed for seed, cohorts in by_seed.items() if cohorts == set(cohort_names)}
+    for record in runs:
+        by_seed.setdefault(record["torch_seed"], set()).add(
+            record["target_cohort"]
+        )
+
+    return {
+        seed
+        for seed, cohorts in by_seed.items()
+        if cohorts == set(COHORT_NAMES)
+    }
+
+
+def checkpoint_path_for(
+    directory: Path,
+    seed: int,
+    target: str,
+) -> Path:
+    return directory / f"seed{seed}_target{target}.pt"
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
-    harmonization_half, heldout_half = train_test_split(
-        patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
+    return train_test_split(
+        patients,
+        test_size=0.5,
+        random_state=TARGET_HOLDOUT_SEED,
         stratify=[p.label for p in patients],
     )
-    return harmonization_half, heldout_half
+
+
+def split_source_data(
+    all_cohorts: dict,
+    target_cohort: str,
+) -> tuple[list, list, list]:
+    target_harmonization, _ = split_target_cohort(
+        all_cohorts[target_cohort]
+    )
+
+    source_train = []
+    source_val = []
+
+    for name in COHORT_NAMES:
+        if name == target_cohort:
+            continue
+
+        train_p, val_p = train_test_split(
+            all_cohorts[name],
+            test_size=0.2,
+            random_state=VAL_SPLIT_SEED,
+            stratify=[p.label for p in all_cohorts[name]],
+        )
+        source_train.extend(train_p)
+        source_val.extend(val_p)
+
+    return source_train, source_val, target_harmonization
 
 
 def predict_probs(
-    model: HarmonizationModel,
+    model: CNNClassifier3D,
     patients: list,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Same as b_sweep_multi.py's predict_probs -- reads straight from
-    model.aux_clf. After alternating_classifier_finetune, aux_clf holds a
-    real, fully-converged sklearn fit (folded into linear-layer form), not
-    a jointly-SGD-trained proxy -- so this is exactly the classifier that
-    was used throughout the fine-tune, not a stand-in for it.
-    """
     model = model.to(device)
     model.eval()
-    probs, ys = [], []
+
+    probs = []
+    ys = []
+
     with torch.no_grad():
         for patient in patients:
             vol = (
                 torch.from_numpy(patient.pet_masked.astype("float32"))
-                .unsqueeze(0).unsqueeze(0)
+                .unsqueeze(0)
+                .unsqueeze(0)
                 .to(device)
             )
-            z = model.encode(patient.cohort, vol)
-            logit = model.classify(z)
-            probs.append(torch.sigmoid(logit).item())
+            probs.append(torch.sigmoid(model(vol)).item())
             ys.append(patient.label)
+
     return np.array(probs), np.array(ys)
 
 
-def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict | None:
+def eval_on(
+    y: np.ndarray,
+    y_prob: np.ndarray,
+) -> dict | None:
     if len(y) == 0:
         return None
-    y_pred = (y_prob >= threshold).astype(int)
+
+    y_pred = (y_prob >= 0.5).astype(int)
     acc = accuracy_score(y, y_pred)
-    auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
-    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
-    recall_pos = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-    recall_neg = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-    balanced_acc = float(np.nanmean([recall_pos, recall_neg]))
+    auc = (
+        roc_auc_score(y, y_prob)
+        if len(np.unique(y)) > 1
+        else float("nan")
+    )
+
+    tn, fp, fn, tp = confusion_matrix(
+        y,
+        y_pred,
+        labels=[0, 1],
+    ).ravel()
+
+    recall_pos = (
+        tp / (tp + fn)
+        if tp + fn > 0
+        else float("nan")
+    )
+    recall_neg = (
+        tn / (tn + fp)
+        if tn + fp > 0
+        else float("nan")
+    )
+
     return {
-        "acc": float(acc), "auc": float(auc),
-        "recall_pos": float(recall_pos), "recall_neg": float(recall_neg),
-        "balanced_acc": balanced_acc,
-        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        "acc": float(acc),
+        "auc": float(auc),
+        "recall_pos": float(recall_pos),
+        "recall_neg": float(recall_neg),
+        "balanced_acc": float(
+            np.nanmean([recall_pos, recall_neg])
+        ),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
     }
 
 
 def train_model_once(
-    torch_seed: int, all_cohorts: dict, target_cohort: str
-) -> tuple[HarmonizationModel, dict, list, list]:
-    target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
+    seed: int,
+    all_cohorts: dict,
+    target_cohort: str,
+) -> tuple[CNNClassifier3D, list]:
+    source_train, source_val, target_harmonization = split_source_data(
+        all_cohorts,
+        target_cohort,
+    )
 
-    cohort_train, cohort_val, cohort_all = {}, {}, {}
-    for name in COHORT_NAMES:
-        cohort_all[name] = all_cohorts[name]
-        is_target = name == target_cohort
-        patients_for_training = target_harmonization if is_target else all_cohorts[name]
+    torch.manual_seed(seed)
 
-        # target's split is NOT label-stratified -- a real deployment-time
-        # unlabeled target cohort has no labels to stratify by, so
-        # stratifying here would be testing under friendlier conditions
-        # than the model will actually see. Known (source) cohorts keep
-        # stratification since their labels genuinely drive lambda_clf
-        # (during the alternating fine-tune) and the classifier fit.
-        train_p, val_p = train_test_split(
-            patients_for_training, test_size=0.2, random_state=VAL_SPLIT_SEED,
-            stratify=None if is_target else [p.label for p in patients_for_training],
-        )
-        cohort_train[name] = train_p
-        cohort_val[name] = val_p
+    model = CNNClassifier3D(
+        latent_dim=LATENT_DIM,
+        encoder_dropout=ENCODER_DROPOUT,
+        classifier_dropout=CLASSIFIER_DROPOUT,
+    )
 
-    torch.manual_seed(torch_seed)
-    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=64)
-
-    if SKIP_STAGE2:
-        # -- stage 1 ONLY: pure recon, no MMD, no clf, with patience/early
-        # stopping genuinely ACTIVE (decoder_freeze_epoch=None makes
-        # patience_active true from epoch 0 -- see module docstring for
-        # why this replaced the earlier n_epochs==decoder_freeze_epoch
-        # trick, which silently disabled early stopping too).
-        # lambda_mmd=0.0 is passed as a LITERAL here, not LAMBDA_MMD --
-        # with decoder_freeze_epoch=None there's no staging to zero it
-        # out automatically, so the passed value directly controls the
-        # loss. DECODER_FREEZE_EPOCH here is a max-epochs CAP; patience
-        # should stop training earlier once val recon plateaus.
-        model = train_harmonization_multi(
-            model,
-            cohort_train=cohort_train, cohort_val=cohort_val,
-            n_epochs=DECODER_FREEZE_EPOCH,
-            lambda_mmd=0.0,
-            lambda_clf=0.0,
-            decoder_freeze_epoch=None,
-            latent_gamma_mode=LATENT_GAMMA_MODE,
-            target_cohort=target_cohort,
-            target_pair_weight=TARGET_PAIR_WEIGHT,
-            pair_weighting=PAIR_WEIGHTING,
-            weighting_ema_beta=WEIGHTING_EMA_BETA,
-            weighting_temperature=WEIGHTING_TEMPERATURE,
-            weighting_floor=WEIGHTING_FLOOR,
-            weighting_ceil=WEIGHTING_CEIL,
-            checkpoint_path=None,
-            patience=PATIENCE,
-        )
-
-        # train_harmonization_multi never froze the decoder in this mode
-        # (the freeze transition never fired -- see above), but
-        # alternating_classifier_finetune assumes an already-frozen
-        # decoder and never freezes it itself. Freeze explicitly here.
-        model.set_decoder_trainable(False)
-
-    else:
-        # -- stage 1-2: pure recon+MMD, no classification signal yet ------------
-        model = train_harmonization_multi(
-            model,
-            cohort_train=cohort_train, cohort_val=cohort_val,
-            n_epochs=N_EPOCHS,
-            lambda_mmd=LAMBDA_MMD,
-            lambda_clf=0.0,
-            decoder_freeze_epoch=DECODER_FREEZE_EPOCH,
-            latent_gamma_mode=LATENT_GAMMA_MODE,
-            target_cohort=target_cohort,
-            target_pair_weight=TARGET_PAIR_WEIGHT,
-            pair_weighting=PAIR_WEIGHTING,
-            weighting_ema_beta=WEIGHTING_EMA_BETA,
-            weighting_temperature=WEIGHTING_TEMPERATURE,
-            weighting_floor=WEIGHTING_FLOOR,
-            weighting_ceil=WEIGHTING_CEIL,
-            checkpoint_path=None,
-            patience=PATIENCE,
-        )
-
-    # -- alternating fine-tune: fit-classifier / train-encoders, repeat -----
-    model = alternating_classifier_finetune(
+    model = train_cnn_baseline(
         model,
-        cohort_train=cohort_train, cohort_val=cohort_val,
-        target_cohort=target_cohort,
-        n_rounds=ALT_N_ROUNDS,
-        epochs_per_round=ALT_EPOCHS_PER_ROUND,
-        lambda_mmd=ALT_LAMBDA_MMD,
-        lr=ALT_LR,
-        target_pair_weight=TARGET_PAIR_WEIGHT,
-        pair_weighting=PAIR_WEIGHTING,
-        weighting_ema_beta=WEIGHTING_EMA_BETA,
-        weighting_temperature=WEIGHTING_TEMPERATURE,
-        weighting_floor=WEIGHTING_FLOOR,
-        weighting_ceil=WEIGHTING_CEIL,
+        train_patients=source_train,
+        val_patients=source_val,
+        n_epochs=N_EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        patience=PATIENCE,
         checkpoint_path=None,
     )
 
-    return model, cohort_all, target_harmonization, target_heldout
+    return model, target_harmonization
+
+
+def get_or_train_model(
+    seed: int,
+    all_cohorts: dict,
+    target_cohort: str,
+    load_dir: Path | None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> tuple[CNNClassifier3D, list, bool]:
+    _, _, target_harmonization = split_source_data(
+        all_cohorts,
+        target_cohort,
+    )
+
+    if load_dir is not None:
+        checkpoint = checkpoint_path_for(
+            load_dir,
+            seed,
+            target_cohort,
+        )
+
+        if checkpoint.exists():
+            print(f"  loading checkpoint from {checkpoint}")
+            model = CNNClassifier3D(
+                latent_dim=LATENT_DIM,
+                encoder_dropout=ENCODER_DROPOUT,
+                classifier_dropout=CLASSIFIER_DROPOUT,
+            )
+            model.load_state_dict(
+                torch.load(checkpoint, map_location="cpu")
+            )
+            return model.to(device), target_harmonization, True
+
+        print(f"  no checkpoint at {checkpoint} -- training")
+
+    model, target_harmonization = train_model_once(
+        seed,
+        all_cohorts,
+        target_cohort,
+    )
+    return model, target_harmonization, False
 
 
 def evaluate_target(
-    torch_seed: int,
-    model: HarmonizationModel,
-    cohort_all: dict,
+    seed: int,
+    model: CNNClassifier3D,
+    all_cohorts: dict,
     target_cohort: str,
     target_harmonization: list,
-    target_heldout: list,
 ) -> dict:
-    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
-    known_patients = [p for name in known_cohorts for p in cohort_all[name]]
+    source_cohorts = [
+        name
+        for name in COHORT_NAMES
+        if name != target_cohort
+    ]
+    source_patients = [
+        p
+        for name in source_cohorts
+        for p in all_cohorts[name]
+    ]
 
-    prob_known, y_known = predict_probs(model, known_patients)
-    prob_harm, y_harm = predict_probs(model, target_harmonization)
-    prob_target, y_target = predict_probs(model, target_heldout)
+    prob_source, y_source = predict_probs(
+        model,
+        source_patients,
+    )
+    prob_target, y_target = predict_probs(
+        model,
+        target_harmonization,
+    )
 
     return {
-        "torch_seed": torch_seed,
+        "torch_seed": seed,
         "target_cohort": target_cohort,
-        "known_cohorts": known_cohorts,
-        "known_cohort_insample": eval_on(y_known, prob_known),
-        "target_cohort_harmonization_half": eval_on(y_harm, prob_harm),
-        "target_cohort_raw": eval_on(y_target, prob_target),
+        "known_cohorts": source_cohorts,
+        "known_cohort_insample": eval_on(
+            y_source,
+            prob_source,
+        ),
+        "target_cohort_harmonization_half": eval_on(
+            y_target,
+            prob_target,
+        ),
     }
 
 
-def summarize(results: list, key: str, label: str) -> dict:
-    accs          = [r[key]["acc"] for r in results if r[key] is not None]
-    aucs          = [r[key]["auc"] for r in results if r[key] is not None]
-    recalls_pos   = [r[key]["recall_pos"] for r in results if r[key] is not None]
-    recalls_neg   = [r[key]["recall_neg"] for r in results if r[key] is not None]
-    balanced_accs = [r[key]["balanced_acc"] for r in results if r[key] is not None]
+def summarize(
+    results: list[dict],
+    key: str,
+    label: str,
+) -> dict:
+    metrics = {
+        "acc": [r[key]["acc"] for r in results],
+        "auc": [r[key]["auc"] for r in results],
+        "recall_pos": [r[key]["recall_pos"] for r in results],
+        "recall_neg": [r[key]["recall_neg"] for r in results],
+        "balanced_acc": [
+            r[key]["balanced_acc"]
+            for r in results
+        ],
+    }
 
-    print(f"\n=== {label} across {len(accs)} runs ===")
-    print(f"acc            : {np.nanmean(accs):.3f} +/- {np.nanstd(accs):.3f}")
-    print(f"auc            : {np.nanmean(aucs):.3f} +/- {np.nanstd(aucs):.3f}")
-    print(f"recall(pos)    : {np.nanmean(recalls_pos):.3f} +/- {np.nanstd(recalls_pos):.3f}")
-    print(f"recall(neg)    : {np.nanmean(recalls_neg):.3f} +/- {np.nanstd(recalls_neg):.3f}")
-    print(f"balanced acc   : {np.nanmean(balanced_accs):.3f} +/- {np.nanstd(balanced_accs):.3f}")
-    print(f"per-run acc    : {[round(a, 3) for a in accs]}")
-    print(f"per-run auc    : {[round(a, 3) for a in aucs]}")
-    print(f"per-run rec+   : {[round(r, 3) for r in recalls_pos]}")
-    print(f"per-run rec-   : {[round(r, 3) for r in recalls_neg]}")
-    print(f"per-run bacc   : {[round(b, 3) for b in balanced_accs]}")
+    print(f"\n=== {label} across {len(results)} runs ===")
+
+    for name, values in metrics.items():
+        print(
+            f"{name:15s}: "
+            f"{np.nanmean(values):.3f} +/- "
+            f"{np.nanstd(values):.3f}"
+        )
 
     return {
         "label": label,
         "key": key,
-        "n_runs": len(accs),
-        "acc_mean": float(np.nanmean(accs)), "acc_std": float(np.nanstd(accs)),
-        "auc_mean": float(np.nanmean(aucs)), "auc_std": float(np.nanstd(aucs)),
-        "recall_pos_mean": float(np.nanmean(recalls_pos)), "recall_pos_std": float(np.nanstd(recalls_pos)),
-        "recall_neg_mean": float(np.nanmean(recalls_neg)), "recall_neg_std": float(np.nanstd(recalls_neg)),
-        "balanced_acc_mean": float(np.nanmean(balanced_accs)), "balanced_acc_std": float(np.nanstd(balanced_accs)),
-        "per_run_acc": [round(a, 3) for a in accs],
-        "per_run_auc": [round(a, 3) for a in aucs],
-        "per_run_recall_pos": [round(r, 3) for r in recalls_pos],
-        "per_run_recall_neg": [round(r, 3) for r in recalls_neg],
-        "per_run_balanced_acc": [round(b, 3) for b in balanced_accs],
+        "n_runs": len(results),
+        **{
+            f"{name}_mean": float(np.nanmean(values))
+            for name, values in metrics.items()
+        },
+        **{
+            f"{name}_std": float(np.nanstd(values))
+            for name, values in metrics.items()
+        },
+        **{
+            f"per_run_{name}": [
+                round(v, 3)
+                for v in values
+            ]
+            for name, values in metrics.items()
+        },
     }
 
 
 if __name__ == "__main__":
     args = parse_args()
+
     data_path = Path(args.data_path)
     results_path = Path(args.results_path)
+    load_dir = (
+        Path(args.load_dir)
+        if args.load_dir
+        else None
+    )
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else None
+    )
 
-    print(f"data path    : {data_path}")
-    print(f"results path : {results_path}")
-    print(f"cohorts      : {COHORT_NAMES}")
-    print(f"pipeline     : {'2-stage (skip stage 2)' if SKIP_STAGE2 else '3-stage'}")
-    print(f"alt fine-tune: {ALT_N_ROUNDS} rounds x {ALT_EPOCHS_PER_ROUND} epochs  "
-          f"lambda_mmd={ALT_LAMBDA_MMD}  lr={ALT_LR}")
+    if output_dir is not None:
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    print("[CNN baseline matched to D where applicable]")
+    print(f"channels           : 16 -> 32 -> 64")
+    print(f"latent             : {LATENT_DIM}")
+    print(f"encoder dropout    : {ENCODER_DROPOUT}")
+    print(f"classifier dropout : {CLASSIFIER_DROPOUT}")
+    print(f"batch              : {BATCH_SIZE}")
+    print(f"optimizer          : AdamW")
+    print(f"lr                 : {LR}")
+    print(f"weight decay       : {WEIGHT_DECAY}")
 
     all_cohorts = load_all_cohorts(data_path)
+
     for name in COHORT_NAMES:
         if name not in all_cohorts:
-            raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
+            raise ValueError(
+                f"Cohort '{name}' not found. "
+                f"Available: {list(all_cohorts.keys())}"
+            )
 
-    existing_runs = [] if args.fresh else load_existing_results(results_path)
-    done_seeds = complete_seeds(existing_runs, COHORT_NAMES) & set(TORCH_SEEDS)
-    results = [r for r in existing_runs if r["torch_seed"] in done_seeds]
+    existing_runs = (
+        []
+        if args.fresh
+        else load_existing_results(results_path)
+    )
 
-    discarded_seeds = {r["torch_seed"] for r in existing_runs} - done_seeds
-    if discarded_seeds:
-        print(f"discarding incomplete/outdated seed(s) found in {results_path}: "
-              f"{sorted(discarded_seeds)} (redoing from scratch)")
+    done_seeds = (
+        complete_seeds(existing_runs)
+        & set(TORCH_SEEDS)
+    )
+
+    results = [
+        r
+        for r in existing_runs
+        if r["torch_seed"] in done_seeds
+    ]
 
     results_path.write_text("")
-    for r in results:
-        append_result(r, results_path)
+    for record in results:
+        append_result(record, results_path)
 
-    seeds_to_run = [s for s in TORCH_SEEDS if s not in done_seeds]
-    if args.fresh:
-        print(f"--fresh: running all {len(seeds_to_run)} seeds: {seeds_to_run}")
-    elif done_seeds:
-        print(f"resuming: {len(done_seeds)} seed(s) already complete {sorted(done_seeds)}, "
-              f"running {len(seeds_to_run)} more: {seeds_to_run}")
-    else:
-        print(f"no usable prior results -- running all {len(seeds_to_run)} seeds: {seeds_to_run}")
-
-    for torch_seed in seeds_to_run:
+    for seed in [
+        s
+        for s in TORCH_SEEDS
+        if s not in done_seeds
+    ]:
         for target_cohort in COHORT_NAMES:
-            print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
-                  f"(50% of {target_cohort} in training, 50% fully held out)\n{'='*60}")
-            model, cohort_all, target_harmonization, target_heldout = train_model_once(
-                torch_seed, all_cohorts, target_cohort
+            print(
+                f"\n{'=' * 60}\n"
+                f"TORCH SEED {seed}  "
+                f"target={target_cohort}\n"
+                f"{'=' * 60}"
             )
 
-            print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} "
-                  f"(held out: {len(target_heldout)}, in-training: {len(target_harmonization)}) ---")
-            r = evaluate_target(
-                torch_seed, model, cohort_all, target_cohort, target_harmonization, target_heldout
+            (
+                model,
+                target_harmonization,
+                was_loaded,
+            ) = get_or_train_model(
+                seed,
+                all_cohorts,
+                target_cohort,
+                load_dir,
             )
-            append_result(r, results_path)
-            results.append(r)
-            print(f"  known cohorts (in-sample)      : {r['known_cohort_insample']}")
-            print(f"  {target_cohort} (harmonization half) : {r['target_cohort_harmonization_half']}")
-            print(f"  {target_cohort} (held out, raw)       : {r['target_cohort_raw']}")
 
-    summary_stats = []
+            if (
+                not was_loaded
+                and output_dir is not None
+            ):
+                checkpoint = checkpoint_path_for(
+                    output_dir,
+                    seed,
+                    target_cohort,
+                )
+                torch.save(
+                    model.state_dict(),
+                    checkpoint,
+                )
+                print(
+                    f"  saved checkpoint -> {checkpoint}"
+                )
+
+            record = evaluate_target(
+                seed,
+                model,
+                all_cohorts,
+                target_cohort,
+                target_harmonization,
+            )
+
+            append_result(
+                record,
+                results_path,
+            )
+            results.append(record)
+
+            print(
+                f"  {target_cohort} "
+                f"(harmonization half): "
+                f"{record['target_cohort_harmonization_half']}"
+            )
+
+    summaries = []
+
     for target_cohort in COHORT_NAMES:
-        subset = [r for r in results if r["target_cohort"] == target_cohort]
-        if not subset:
-            continue
-        summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (held-out, raw)"))
+        subset = [
+            r
+            for r in results
+            if r["target_cohort"] == target_cohort
+        ]
 
-    summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (held-out, raw)"))
+        summaries.append(
+            summarize(
+                subset,
+                "target_cohort_harmonization_half",
+                f"target={target_cohort} "
+                f"(harmonization half)",
+            )
+        )
 
-    for s in summary_stats:
-        append_summary(s, results_path)
-    print(f"\nsummary appended to: {results_path}")
+    summaries.append(
+        summarize(
+            results,
+            "target_cohort_harmonization_half",
+            "ALL target cohorts pooled "
+            "(harmonization half)",
+        )
+    )
+
+    for summary in summaries:
+        append_summary(
+            summary,
+            results_path,
+        )
+
+    print(
+        f"\nsummary appended to: {results_path}"
+    )
