@@ -212,6 +212,22 @@ def _adaptive_pair_weights(
     }
 
 
+def _exposure_weights(
+    cohort_train: dict[str, list],
+    names: list[str],
+) -> dict[str, float]:
+    max_size = max(len(cohort_train[name]) for name in names)
+    raw = {
+        name: len(cohort_train[name]) / max_size
+        for name in names
+    }
+    mean_raw = sum(raw.values()) / len(raw)
+    return {
+        name: weight / mean_raw
+        for name, weight in raw.items()
+    }
+
+
 class VolumeDataset(Dataset):
 
     def __init__(self, patients: list):
@@ -293,6 +309,7 @@ def train_harmonization_multi(
 
     driver_name = max(cohort_names, key=lambda n: len(cohort_train[n]))
     driver_size = len(cohort_train[driver_name])
+    recon_exposure_weights = _exposure_weights(cohort_train, cohort_names)
 
     print(f"cohorts      : {cohort_names}  ({n_pairs} pairs)")
     print(f"target       : {target_cohort!r}  (pairs touching it stay pooled)")
@@ -303,6 +320,7 @@ def train_harmonization_multi(
              f"floor={weighting_floor}, ceil={weighting_ceil})"
     ))
     print(f"driver cohort: {driver_name!r} ({driver_size} patients) -- others oversampled to match")
+    print(f"recon exposure weights: {recon_exposure_weights}")
     print(f"latent gamma : {latent_gamma_mode}")
     if decoder_freeze_epoch is not None:
         print(f"decoder freeze at epoch {decoder_freeze_epoch} (stage-2 encoder-only training)")
@@ -375,7 +393,7 @@ def train_harmonization_multi(
             for name, (vol, label) in batch_dict.items():
                 vol = vol.to(device)
                 x_hat, z = model.reconstruct(name, vol)
-                recon = recon + F.mse_loss(x_hat, vol)
+                recon = recon + recon_exposure_weights[name] * F.mse_loss(x_hat, vol)
                 zs[name] = z
 
 
@@ -429,49 +447,45 @@ def train_harmonization_multi(
 
         model.eval()
         val_recon = 0.0
-        val_zs = {}
-        val_labels = {}
+        val_mmd_latent = 0.0
+        n_val_batches = 0
 
         with torch.no_grad():
-            for name in cohort_names:
-                z_parts = []
-                label_parts = []
-                recon_sum = 0.0
-                n_elements = 0
+            for batch_dict in _cycling_batches(val_loaders):
+                zs, batch_labels = {}, {}
+                recon = torch.zeros((), device=device)
 
-                for vol, label in val_loaders[name]:
+                for name, (vol, label) in batch_dict.items():
                     vol = vol.to(device)
                     x_hat, z = model.reconstruct(name, vol)
-
-                    recon_sum += F.mse_loss(x_hat, vol, reduction="sum").item()
-                    n_elements += vol.numel()
-                    z_parts.append(z)
+                    # Keep validation identical to baseline; exposure correction is a training-only ablation.
+                    recon = recon + F.mse_loss(x_hat, vol)
+                    zs[name] = z
 
                     if target_cohort is not None and name != target_cohort:
-                        label_parts.append(label.to(device))
+                        batch_labels[name] = label.to(device)
 
-                val_recon += recon_sum / max(n_elements, 1)
-                val_zs[name] = torch.cat(z_parts, dim=0)
+                mmd_latent, _ = pairwise_mmd(
+                    zs,
+                    fixed_gammas=fixed_latent_gammas,
+                    target_cohort=target_cohort,
+                    labels=batch_labels,
+                    target_pair_weight=target_pair_weight,
+                    pair_weights=_adaptive_pair_weights(
+                        pair_mmd_ema,
+                        pair_weighting,
+                        weighting_temperature,
+                        weighting_floor,
+                        weighting_ceil,
+                    ),
+                )
 
-                if label_parts:
-                    val_labels[name] = torch.cat(label_parts, dim=0)
+                val_recon += recon.item()
+                val_mmd_latent += mmd_latent.item()
+                n_val_batches += 1
 
-            val_mmd_tensor, _ = pairwise_mmd(
-                val_zs,
-                fixed_gammas=fixed_latent_gammas,
-                target_cohort=target_cohort,
-                labels=val_labels,
-                target_pair_weight=target_pair_weight,
-                pair_weights=_adaptive_pair_weights(
-                    pair_mmd_ema,
-                    pair_weighting,
-                    weighting_temperature,
-                    weighting_floor,
-                    weighting_ceil,
-                ),
-            )
-
-        val_mmd_latent = val_mmd_tensor.item()
+        val_recon /= max(n_val_batches, 1)
+        val_mmd_latent /= max(n_val_batches, 1)
         val_loss = val_recon + lambda_mmd_t * val_mmd_latent
 
         if epoch % 10 == 0 or epoch == n_epochs - 1:
@@ -579,6 +593,8 @@ def alternating_classifier_finetune(
             model.aux_clf.bias.copy_(torch.tensor([b_eff], dtype=torch.float32, device=device))
     driver_name = max(cohort_names, key=lambda n: len(cohort_train[n]))
     driver_size = len(cohort_train[driver_name])
+    recon_exposure_weights = _exposure_weights(cohort_train, cohort_names)
+    clf_exposure_weights = _exposure_weights(cohort_train, source_cohorts)
     train_loaders = {}
     for name in cohort_names:
         patients = cohort_train[name]
@@ -598,6 +614,8 @@ def alternating_classifier_finetune(
         f"  (target_pair_weight={target_pair_weight})" if pair_weighting == "static"
         else f"  (ema_beta={weighting_ema_beta}, temperature={weighting_temperature}, reset every round)"
     ))
+    print(f"recon exposure weights: {recon_exposure_weights}")
+    print(f"clf exposure weights: {clf_exposure_weights}")
     best_val_clf = float("inf")
     best_state = copy.deepcopy(model.state_dict())
     best_round = -1
@@ -625,13 +643,13 @@ def alternating_classifier_finetune(
                 for name, (vol, label) in batch_dict.items():
                     vol = vol.to(device)
                     x_hat, z = model.reconstruct(name, vol)
-                    recon = recon + F.mse_loss(x_hat, vol)
+                    recon = recon + recon_exposure_weights[name] * F.mse_loss(x_hat, vol)
                     zs[name] = z
                     if name != target_cohort:
                         label = label.to(device)
                         batch_labels[name] = label
                         logit = model.classify(z)
-                        clf_loss = clf_loss + F.binary_cross_entropy_with_logits(
+                        clf_loss = clf_loss + clf_exposure_weights[name] * F.binary_cross_entropy_with_logits(
                             logit.float(), label.float(), pos_weight=pos_weight
                         )
                 mmd_latent, mmd_terms_this_step = pairwise_mmd(
@@ -732,7 +750,7 @@ if __name__ == "__main__":
         cohort_val[name] = val_p
         print(f"{name:12s}: {len(train_p)} train / {len(val_p)} val  (all {len(patients)} used)")
     torch.manual_seed(41)
-    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=32)
+    model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=16)
     checkpoint_name = f"best_harmonization_multi_target-{TARGET_COHORT or 'none'}.pt"
     model = train_harmonization_multi(
         model,
