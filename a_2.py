@@ -12,7 +12,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 
-DATA_PATH = "CUBES-Labelled-COHORTS-ZSCORE"
+DATA_PATH = "CUBES-Labelled-COHORTS"
 
 
 class Encoder3D(nn.Module):
