@@ -1,19 +1,10 @@
-"""
-CNN baseline, leave-one-cohort-out sweep across 3 cohorts.
+"""CNN3 leave-one-cohort-out sweep across AUGSBURG, PRE-RAPID, and SWISS.
 
-Adapts cnn_sweep_norm.py's 2-cohort (fixed AUGSBURG-train / PRE-RAPID-test)
-design to N cohorts, matching b_sweep_multi.py's structure: every cohort
-takes a turn as target, the CNN trains on the pooled labels of the other
-two ("known") cohorts, and is evaluated on a genuinely held-out half of
-target -- never seen in any form, since this CNN (unlike the harmonization
-approaches) has no unsupervised stage that could see target's images
-either. The 50/50 split is kept anyway so target's evaluation set here is
-IDENTICAL to the harmonization sweeps' held-out half -- this is the
-no-harmonization baseline those approaches need to beat, and that
-comparison is only valid if all approaches are scored on the same patients.
-
-Reuses cnn.py's model/training/correction code directly rather than
-duplicating it.
+For each target cohort, one CNN is trained on labeled patients from the two
+source cohorts. The target cohort is split 50/50 with TARGET_HOLDOUT_SEED=123
+to preserve the same held-out membership used by A3/B3/C3, but CNN3 does not
+train on either target half. The harmonization half is reported only as a
+diagnostic; target_heldout is the final evaluation.
 """
 
 from __future__ import annotations
@@ -24,324 +15,586 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from cnn import CNNClassifier3D, train_cnn_baseline
+from cnn_3 import (
+    CNNClassifier3D,
+    eval_on,
+    predict_probs,
+    train_cnn_baseline,
+)
 from nifti_loader import load_all_cohorts
 
-# Defaults -- overridable via --data-path / --results-path for automation.
-DEFAULT_DATA_PATH    = "CUBES-Labelled-COHORTS"
-DEFAULT_RESULTS_PATH = "cnn_sweep_multi_results.jsonl"
 
-COHORT_NAMES   = ["AUGSBURG", "PRE-RAPID", "SWISS"]
-LATENT_DIM     = 16               # fixed -- 16-dim beat 64-dim in the earlier 5-seed 2-cohort comparison
-TORCH_SEEDS    = list(range(25))   # matches the seed count used by the harmonization sweeps this session
-VAL_SPLIT_SEED = 40                # fixed -- same known-cohort train/val split across all runs
-TARGET_HOLDOUT_SEED = 123          # fixed -- same held-out half of target across all torch seeds,
-                                    # and the SAME patients the harmonization sweeps hold out --
-                                    # required for a fair cross-approach comparison
-N_EPOCHS       = 50
+DEFAULT_DATA_PATH = "CUBES-Labelled-COHORTS_3"
+DEFAULT_RESULTS_PATH = "cnn_3.jsonl"
+
+COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
+TORCH_SEEDS = list(range(10))
+VAL_SPLIT_SEED = 40
+TARGET_HOLDOUT_SEED = 123
+
+LATENT_DIM = 16
+DROPOUT = 0.5
+N_EPOCHS = 200
+BATCH_SIZE = 8
+LR = 1e-3
+WEIGHT_DECAY = 1e-3
+PATIENCE = 50
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CNN baseline, leave-one-cohort-out sweep across all cohort combinations and torch seeds")
-    parser.add_argument(
-        "--data-path", default=DEFAULT_DATA_PATH,
-        help=f"Directory containing all cohorts' data (default: {DEFAULT_DATA_PATH})",
+    parser = argparse.ArgumentParser(
+        description="CNN3 leave-one-cohort-out sweep"
     )
     parser.add_argument(
-        "--results-path", default=DEFAULT_RESULTS_PATH,
-        help=f"Where to write/resume sweep results (default: {DEFAULT_RESULTS_PATH}).",
+        "--data-path",
+        default=DEFAULT_DATA_PATH,
+        help=f"Directory containing cohort data (default: {DEFAULT_DATA_PATH})",
     )
     parser.add_argument(
-        "--fresh", action="store_true",
-        help="Wipe --results-path and rerun every seed in TORCH_SEEDS from scratch, "
-             "ignoring anything already there. Default: resume -- reuse any torch_seed "
-             "that already has a complete run (all cohorts as target) in --results-path, "
-             "and only run the seeds still missing.",
+        "--results-path",
+        default=DEFAULT_RESULTS_PATH,
+        help=f"Where to write/resume results (default: {DEFAULT_RESULTS_PATH})",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Wipe --results-path and rerun every seed from scratch.",
     )
     return parser.parse_args()
 
 
-def append_result(r: dict, results_path: Path) -> None:
-    r = {"record_type": "run", **r}
+def append_result(
+    result: dict,
+    results_path: Path,
+) -> None:
     with open(results_path, "a") as f:
-        f.write(json.dumps(r) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "record_type": "run",
+                    **result,
+                }
+            )
+            + "\n"
+        )
 
 
-def append_summary(s: dict, results_path: Path) -> None:
-    s = {"record_type": "summary", **s}
+def append_summary(
+    summary: dict,
+    results_path: Path,
+) -> None:
     with open(results_path, "a") as f:
-        f.write(json.dumps(s) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "record_type": "summary",
+                    **summary,
+                }
+            )
+            + "\n"
+        )
 
 
-def load_existing_results(results_path: Path) -> list[dict]:
-    """Load previously written 'run' records from results_path, if any.
-    'summary' records are dropped unconditionally -- the summary is always
-    regenerated fresh from the full (resumed + new) result set at the end
-    of this run, never carried over from a prior run's aggregation.
-    """
+def load_existing_results(
+    results_path: Path,
+) -> list[dict]:
     if not results_path.exists():
         return []
+
     runs = []
+
     with open(results_path) as f:
         for line in f:
             line = line.strip()
+
             if not line:
                 continue
+
             rec = json.loads(line)
-            if rec.pop("record_type", None) == "run":
-                runs.append(rec)   # record_type popped -- shape now matches evaluate_target()'s return
+
+            if rec.pop(
+                "record_type",
+                None,
+            ) == "run":
+                runs.append(rec)
+
     return runs
 
 
-def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
-    """A torch_seed counts as complete only if it has a run record for
-    EVERY cohort as target. A seed interrupted partway through its cohort
-    rotation is NOT complete -- its partial rows get discarded and the
-    whole seed is redone from scratch below, rather than silently
-    averaging in an incomplete seed. Also means a COHORT_NAMES change
-    (e.g. a cohort added) correctly invalidates old seeds that only
-    covered the previous, smaller cohort set.
-    """
+def complete_seeds(
+    runs: list[dict],
+    cohort_names: list[str],
+) -> set[int]:
     by_seed: dict[int, set[str]] = {}
-    for r in runs:
-        by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
-    return {seed for seed, cohorts in by_seed.items() if cohorts == set(cohort_names)}
 
+    for result in runs:
+        if result.get(
+            "target_heldout"
+        ) is None:
+            continue
 
-def split_target_cohort(patients: list) -> tuple[list, list]:
-    """Stratified 50/50 split of the target cohort's patients. The CNN
-    never trains on either half (no unsupervised stage exists to use the
-    "harmonization half" the way the harmonization approaches do) -- both
-    halves are equally untouched by training. Kept anyway so
-    target_heldout is IDENTICAL to the harmonization sweeps' held-out set,
-    which is required for a valid apples-to-apples baseline comparison.
-    Fixed random_state so the same held-out half is used regardless of
-    torch_seed, matching the harmonization sweeps exactly (same seed value
-    too -- TARGET_HOLDOUT_SEED=123 in both).
-    """
-    harmonization_half, heldout_half = train_test_split(
-        patients, test_size=0.5, random_state=TARGET_HOLDOUT_SEED,
-        stratify=[p.label for p in patients],
-    )
-    return harmonization_half, heldout_half
+        by_seed.setdefault(
+            result["torch_seed"],
+            set(),
+        ).add(
+            result["target_cohort"]
+        )
 
-
-def get_probs(model, plist, device="cuda" if torch.cuda.is_available() else "cpu"):
-    model.eval()
-    ys, probs = [], []
-    with torch.no_grad():
-        for p in plist:
-            vol = torch.from_numpy(p.pet_masked.astype("float32")).unsqueeze(0).unsqueeze(0).to(device)
-            probs.append(torch.sigmoid(model(vol)).item())
-            ys.append(p.label)
-    return np.array(probs), np.array(ys)
-
-
-def eval_on(y: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict | None:
-    """Same metric shape as b_sweep_multi.py's eval_set -- acc, auc,
-    recall_pos, recall_neg, balanced_acc, confusion matrix."""
-    if len(y) == 0:
-        return None
-    y_pred = (y_prob >= threshold).astype(int)
-    acc = accuracy_score(y, y_pred)
-    bacc = balanced_accuracy_score(y, y_pred)
-    auc = roc_auc_score(y, y_prob) if len(np.unique(y)) > 1 else float("nan")
-    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
-    recall_pos = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-    recall_neg = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
     return {
-        "acc": float(acc), "auc": float(auc),
-        "recall_pos": float(recall_pos), "recall_neg": float(recall_neg),
-        "balanced_acc": float(bacc),
-        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        seed
+        for seed, completed_targets in by_seed.items()
+        if completed_targets == set(cohort_names)
     }
 
 
-def train_model_once(
-    torch_seed: int, all_cohorts: dict, target_cohort: str
-) -> tuple[CNNClassifier3D, dict, list, list]:
-    """Train the CNN for this (torch_seed, target_cohort) combination on
-    the POOLED labels of the two known (non-target) cohorts -- the
-    multi-cohort analogue of "train on all of AUGSBURG" in the 2-cohort
-    script. Because which cohorts are "known" changes with target_cohort,
-    the model is retrained per (seed, target_cohort) pair, same as the
-    harmonization sweeps.
-
-    Returns the trained model, cohort_all (all patients per cohort,
-    unsplit), the target cohort's harmonization half (untouched by
-    training, kept as a diagnostic to compare against the true held-out
-    half below), and the target cohort's held-out half (the real test,
-    identical to the harmonization sweeps' held-out set).
-    """
-    target_harmonization, target_heldout = split_target_cohort(all_cohorts[target_cohort])
-
-    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
-    known_patients = [p for name in known_cohorts for p in all_cohorts[name]]
-
-    train_known, val_known = train_test_split(
-        known_patients, test_size=0.2, random_state=VAL_SPLIT_SEED,
-        stratify=[p.label for p in known_patients],
+def split_target_cohort(
+    patients: list,
+) -> tuple[list, list]:
+    return train_test_split(
+        patients,
+        test_size=0.5,
+        random_state=TARGET_HOLDOUT_SEED,
+        stratify=[
+            p.label
+            for p in patients
+        ],
     )
 
-    torch.manual_seed(torch_seed)
-    model = CNNClassifier3D(latent_dim=LATENT_DIM)
+
+def split_source_cohort(
+    patients: list,
+) -> tuple[list, list]:
+    return train_test_split(
+        patients,
+        test_size=0.2,
+        random_state=VAL_SPLIT_SEED,
+        stratify=[
+            p.label
+            for p in patients
+        ],
+    )
+
+
+def train_model_once(
+    torch_seed: int,
+    all_cohorts: dict,
+    target_cohort: str,
+) -> tuple[
+    CNNClassifier3D,
+    list[str],
+    list,
+    list,
+]:
+    target_harmonization, target_heldout = (
+        split_target_cohort(
+            all_cohorts[target_cohort]
+        )
+    )
+
+    source_cohorts = [
+        name
+        for name in COHORT_NAMES
+        if name != target_cohort
+    ]
+
+    source_train = []
+    source_val = []
+
+    for name in source_cohorts:
+        train_patients, val_patients = (
+            split_source_cohort(
+                all_cohorts[name]
+            )
+        )
+
+        source_train.extend(
+            train_patients
+        )
+        source_val.extend(
+            val_patients
+        )
+
+    torch.manual_seed(
+        torch_seed
+    )
+
+    model = CNNClassifier3D(
+        latent_dim=LATENT_DIM,
+        dropout=DROPOUT,
+    )
+
     model = train_cnn_baseline(
         model,
-        train_patients=train_known, val_patients=val_known,
+        train_patients=source_train,
+        val_patients=source_val,
         n_epochs=N_EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        patience=PATIENCE,
         checkpoint_path=None,
     )
-    return model, all_cohorts, target_harmonization, target_heldout
+
+    return (
+        model,
+        source_cohorts,
+        target_harmonization,
+        target_heldout,
+    )
 
 
 def evaluate_target(
     torch_seed: int,
     model: CNNClassifier3D,
-    cohort_all: dict,
+    all_cohorts: dict,
     target_cohort: str,
+    source_cohorts: list[str],
     target_harmonization: list,
     target_heldout: list,
 ) -> dict:
-    """Evaluate on the target cohort's held-out half -- the CNN never saw
-    ANY of target's data in any form during training (unlike the
-    harmonization approaches' unsupervised harmonization-half exposure),
-    so target_cohort_harmonization_half here is purely a diagnostic
-    comparison point, not evidence of a train/test gap the way it is for
-    the harmonization sweeps.
-    """
-    known_cohorts = [c for c in COHORT_NAMES if c != target_cohort]
-    known_patients = [p for name in known_cohorts for p in cohort_all[name]]
+    source_patients = [
+        patient
+        for name in source_cohorts
+        for patient in all_cohorts[name]
+    ]
 
-    prob_known, y_known = get_probs(model, known_patients)
-    prob_harm, y_harm = get_probs(model, target_harmonization)
-    prob_target, y_target = get_probs(model, target_heldout)
+    prob_source, y_source = (
+        predict_probs(
+            model,
+            source_patients,
+        )
+    )
+    prob_harm, y_harm = (
+        predict_probs(
+            model,
+            target_harmonization,
+        )
+    )
+    prob_heldout, y_heldout = (
+        predict_probs(
+            model,
+            target_heldout,
+        )
+    )
 
     return {
+        "model": "CNN3",
         "torch_seed": torch_seed,
         "target_cohort": target_cohort,
-        "known_cohorts": known_cohorts,
-        "known_cohort_insample": eval_on(y_known, prob_known),               # in-sample, reference only
-        "target_cohort_harmonization_half": eval_on(y_harm, prob_harm),      # diagnostic only -- see docstring
-        "target_cohort_raw": eval_on(y_target, prob_target),                 # held-out half, raw
+        "source_cohorts": source_cohorts,
+        "source_cohorts_insample": eval_on(
+            y_source,
+            prob_source,
+        ),
+        "target_harmonization": eval_on(
+            y_harm,
+            prob_harm,
+        ),
+        "target_heldout": eval_on(
+            y_heldout,
+            prob_heldout,
+        ),
     }
 
 
-def summarize(results: list, key: str, label: str) -> dict:
-    accs          = [r[key]["acc"] for r in results if r[key] is not None]
-    aucs          = [r[key]["auc"] for r in results if r[key] is not None]
-    recalls_pos   = [r[key]["recall_pos"] for r in results if r[key] is not None]
-    recalls_neg   = [r[key]["recall_neg"] for r in results if r[key] is not None]
-    balanced_accs = [r[key]["balanced_acc"] for r in results if r[key] is not None]
+def summarize(
+    results: list,
+    key: str,
+    label: str,
+) -> dict:
+    rows = [
+        result[key]
+        for result in results
+        if result.get(key) is not None
+    ]
 
-    print(f"\n=== {label} across {len(accs)} runs ===")
-    print(f"acc            : {np.nanmean(accs):.3f} +/- {np.nanstd(accs):.3f}")
-    print(f"auc            : {np.nanmean(aucs):.3f} +/- {np.nanstd(aucs):.3f}")
-    print(f"recall(pos)    : {np.nanmean(recalls_pos):.3f} +/- {np.nanstd(recalls_pos):.3f}")
-    print(f"recall(neg)    : {np.nanmean(recalls_neg):.3f} +/- {np.nanstd(recalls_neg):.3f}")
-    print(f"balanced acc   : {np.nanmean(balanced_accs):.3f} +/- {np.nanstd(balanced_accs):.3f}")
-    print(f"per-run acc    : {[round(a, 3) for a in accs]}")
-    print(f"per-run auc    : {[round(a, 3) for a in aucs]}")
-    print(f"per-run rec+   : {[round(r, 3) for r in recalls_pos]}")
-    print(f"per-run rec-   : {[round(r, 3) for r in recalls_neg]}")
-    print(f"per-run bacc   : {[round(b, 3) for b in balanced_accs]}")
+    metrics = {
+        "acc": [
+            row["acc"]
+            for row in rows
+        ],
+        "auc": [
+            row["auc"]
+            for row in rows
+        ],
+        "recall_pos": [
+            row["recall_pos"]
+            for row in rows
+        ],
+        "recall_neg": [
+            row["recall_neg"]
+            for row in rows
+        ],
+        "balanced_acc": [
+            row["balanced_acc"]
+            for row in rows
+        ],
+    }
+
+    print(
+        f"\n=== {label} across "
+        f"{len(rows)} runs ==="
+    )
+
+    for name, values in metrics.items():
+        print(
+            f"{name:15s}: "
+            f"{np.nanmean(values):.3f} +/- "
+            f"{np.nanstd(values):.3f}"
+        )
 
     return {
-        "label": label, "key": key, "n_runs": len(accs),
-        "acc_mean": float(np.nanmean(accs)), "acc_std": float(np.nanstd(accs)),
-        "auc_mean": float(np.nanmean(aucs)), "auc_std": float(np.nanstd(aucs)),
-        "recall_pos_mean": float(np.nanmean(recalls_pos)), "recall_pos_std": float(np.nanstd(recalls_pos)),
-        "recall_neg_mean": float(np.nanmean(recalls_neg)), "recall_neg_std": float(np.nanstd(recalls_neg)),
-        "balanced_acc_mean": float(np.nanmean(balanced_accs)), "balanced_acc_std": float(np.nanstd(balanced_accs)),
-        "per_run_acc": [round(a, 3) for a in accs],
-        "per_run_auc": [round(a, 3) for a in aucs],
-        "per_run_recall_pos": [round(r, 3) for r in recalls_pos],
-        "per_run_recall_neg": [round(r, 3) for r in recalls_neg],
-        "per_run_balanced_acc": [round(b, 3) for b in balanced_accs],
+        "model": "CNN3",
+        "label": label,
+        "key": key,
+        "n_runs": len(rows),
+        **{
+            f"{name}_mean": float(
+                np.nanmean(values)
+            )
+            for name, values in metrics.items()
+        },
+        **{
+            f"{name}_std": float(
+                np.nanstd(values)
+            )
+            for name, values in metrics.items()
+        },
     }
 
 
-if __name__ == "__main__":
-    args = parse_args()
-    data_path = Path(args.data_path)
-    results_path = Path(args.results_path)
+def prepare_results(
+    results_path: Path,
+    fresh: bool,
+) -> tuple[
+    list[dict],
+    list[int],
+]:
+    existing_runs = (
+        []
+        if fresh
+        else load_existing_results(
+            results_path
+        )
+    )
 
-    print(f"data path    : {data_path}")
-    print(f"results path : {results_path}")
-    print(f"cohorts      : {COHORT_NAMES}")
+    done_seeds = (
+        complete_seeds(
+            existing_runs,
+            COHORT_NAMES,
+        )
+        & set(TORCH_SEEDS)
+    )
 
-    all_cohorts = load_all_cohorts(data_path)
-    for name in COHORT_NAMES:
-        if name not in all_cohorts:
-            raise ValueError(f"Cohort '{name}' not found. Available cohorts: {list(all_cohorts.keys())}")
+    results = [
+        result
+        for result in existing_runs
+        if result["torch_seed"] in done_seeds
+    ]
 
-    # -- resume/fresh setup ---------------------------------------------
-    # See b_sweep_multi.py for the identical scheme: --fresh (or no prior
-    # file) starts empty; otherwise keep only seeds that are BOTH complete
-    # (every cohort covered) AND still in the current TORCH_SEEDS, discard
-    # everything else (incomplete seeds, seeds outside the current list,
-    # all prior "summary" lines), and rewrite results_path to contain
-    # exactly the kept run records before appending anything new.
-    existing_runs = [] if args.fresh else load_existing_results(results_path)
-    done_seeds = complete_seeds(existing_runs, COHORT_NAMES) & set(TORCH_SEEDS)
-    results = [r for r in existing_runs if r["torch_seed"] in done_seeds]
+    discarded_seeds = {
+        result["torch_seed"]
+        for result in existing_runs
+    } - done_seeds
 
-    discarded_seeds = {r["torch_seed"] for r in existing_runs} - done_seeds
     if discarded_seeds:
-        print(f"discarding incomplete/outdated seed(s) found in {results_path}: "
-              f"{sorted(discarded_seeds)} (redoing from scratch)")
+        print(
+            f"discarding incomplete/outdated "
+            f"seed(s) found in {results_path}: "
+            f"{sorted(discarded_seeds)} "
+            f"(redoing from scratch)"
+        )
 
     results_path.write_text("")
-    for r in results:
-        append_result(r, results_path)
 
-    seeds_to_run = [s for s in TORCH_SEEDS if s not in done_seeds]
-    if args.fresh:
-        print(f"--fresh: running all {len(seeds_to_run)} seeds: {seeds_to_run}")
+    for result in results:
+        append_result(
+            result,
+            results_path,
+        )
+
+    seeds_to_run = [
+        seed
+        for seed in TORCH_SEEDS
+        if seed not in done_seeds
+    ]
+
+    if fresh:
+        print(
+            f"--fresh: running all "
+            f"{len(seeds_to_run)} seeds: "
+            f"{seeds_to_run}"
+        )
     elif done_seeds:
-        print(f"resuming: {len(done_seeds)} seed(s) already complete {sorted(done_seeds)}, "
-              f"running {len(seeds_to_run)} more: {seeds_to_run}")
+        print(
+            f"resuming: {len(done_seeds)} "
+            f"seed(s) already complete "
+            f"{sorted(done_seeds)}, running "
+            f"{len(seeds_to_run)} more: "
+            f"{seeds_to_run}"
+        )
     else:
-        print(f"no usable prior results -- running all {len(seeds_to_run)} seeds: {seeds_to_run}")
+        print(
+            f"no usable prior results -- "
+            f"running all "
+            f"{len(seeds_to_run)} seeds: "
+            f"{seeds_to_run}"
+        )
+
+    return (
+        results,
+        seeds_to_run,
+    )
+
+
+def run_sweep(
+    args: argparse.Namespace,
+) -> None:
+    data_path = Path(
+        args.data_path
+    )
+    results_path = Path(
+        args.results_path
+    )
+
+    print("[CNN3 SWEEP]")
+    print(
+        f"data path    : {data_path}"
+    )
+    print(
+        f"results path : {results_path}"
+    )
+    print(
+        f"cohorts      : {COHORT_NAMES}"
+    )
+    print(
+        f"torch seeds  : {TORCH_SEEDS}"
+    )
+    print(
+        "target harmonization half is "
+        "never used for CNN training"
+    )
+
+    all_cohorts = load_all_cohorts(
+        data_path
+    )
+
+    for name in COHORT_NAMES:
+        if name not in all_cohorts:
+            raise ValueError(
+                f"Cohort '{name}' not found. "
+                f"Available cohorts: "
+                f"{list(all_cohorts.keys())}"
+            )
+
+    results, seeds_to_run = (
+        prepare_results(
+            results_path,
+            args.fresh,
+        )
+    )
 
     for torch_seed in seeds_to_run:
         for target_cohort in COHORT_NAMES:
-            print(f"\n{'='*60}\nTORCH SEED {torch_seed}  target={target_cohort}  "
-                  f"(CNN never trains on ANY of {target_cohort}; 50% is a diagnostic-only "
-                  f"'harmonization half', 50% is the real held-out test)\n{'='*60}")
-            model, cohort_all, target_harmonization, target_heldout = train_model_once(
-                torch_seed, all_cohorts, target_cohort
+            print(
+                f"\n{'=' * 60}\n"
+                f"TORCH SEED {torch_seed}  "
+                f"target={target_cohort}  "
+                f"(target entirely excluded "
+                f"from training)\n"
+                f"{'=' * 60}"
             )
 
-            print(f"\n--- evaluating target={target_cohort}, seed={torch_seed} "
-                  f"(held out: {len(target_heldout)}, diagnostic-only: {len(target_harmonization)}) ---")
-            r = evaluate_target(
-                torch_seed, model, cohort_all, target_cohort, target_harmonization, target_heldout
+            (
+                model,
+                source_cohorts,
+                target_harmonization,
+                target_heldout,
+            ) = train_model_once(
+                torch_seed,
+                all_cohorts,
+                target_cohort,
             )
-            append_result(r, results_path)   # persist immediately, so a crash doesn't lose this run
-            results.append(r)
-            print(f"  known cohorts (in-sample)      : {r['known_cohort_insample']}")
-            print(f"  {target_cohort} (diagnostic-only half) : {r['target_cohort_harmonization_half']}")
-            print(f"  {target_cohort} (held out, raw)       : {r['target_cohort_raw']}")
 
-    # -- per-target-cohort summaries -----------------------------------------
-    # results spans EVERY seed in TORCH_SEEDS -- resumed seeds loaded above
-    # plus whatever just ran -- so this averages across all requested
-    # seeds, not just the ones run this invocation.
+            result = evaluate_target(
+                torch_seed,
+                model,
+                all_cohorts,
+                target_cohort,
+                source_cohorts,
+                target_harmonization,
+                target_heldout,
+            )
+
+            append_result(
+                result,
+                results_path,
+            )
+            results.append(
+                result
+            )
+
+            print(
+                f"  sources in-sample : "
+                f"{result['source_cohorts_insample']}"
+            )
+            print(
+                f"  target harm       : "
+                f"{result['target_harmonization']}"
+            )
+            print(
+                f"  target held-out   : "
+                f"{result['target_heldout']}"
+            )
+
     summary_stats = []
+
     for target_cohort in COHORT_NAMES:
-        subset = [r for r in results if r["target_cohort"] == target_cohort]
-        if not subset:
-            continue
-        summary_stats.append(summarize(subset, "target_cohort_harmonization_half", f"target={target_cohort} (harmonization half)"))
-        summary_stats.append(summarize(subset, "target_cohort_raw", f"target={target_cohort} (held-out, raw)"))
+        subset = [
+            result
+            for result in results
+            if result["target_cohort"] == target_cohort
+        ]
 
-    # -- overall summary across every target-cohort choice -------------------
-    summary_stats.append(summarize(results, "target_cohort_harmonization_half", "ALL target cohorts pooled (harmonization half)"))
-    summary_stats.append(summarize(results, "target_cohort_raw", "ALL target cohorts pooled (held-out, raw)"))
+        if subset:
+            summary_stats.append(
+                summarize(
+                    subset,
+                    "target_heldout",
+                    (
+                        f"target={target_cohort} "
+                        f"(held-out)"
+                    ),
+                )
+            )
 
-    for s in summary_stats:
-        append_summary(s, results_path)
-    print(f"\nsummary appended to: {results_path}")
+    if results:
+        summary_stats.append(
+            summarize(
+                results,
+                "target_heldout",
+                (
+                    "ALL target cohorts pooled "
+                    "(held-out)"
+                ),
+            )
+        )
+
+    for summary in summary_stats:
+        append_summary(
+            summary,
+            results_path,
+        )
+
+    print(
+        f"\nsummary appended to: "
+        f"{results_path}"
+    )
+
+
+if __name__ == "__main__":
+    run_sweep(
+        parse_args()
+    )
