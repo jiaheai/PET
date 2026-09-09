@@ -11,6 +11,11 @@ import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
+from experiment_utils import (
+    experiment_metadata,
+    normalize_split,
+    prepare_results_file,
+)
 from b_3 import (
     HarmonizationModel,
     train_harmonization_multi,
@@ -67,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reset results and rerun every seed. Checkpoint loading is controlled by --load-dir.",
     )
+    parser.add_argument(
+        "--zscore-correction",
+        action="store_true",
+        help="Fit cohort normalization within each target fold.",
+    )
     return parser.parse_args()
 
 
@@ -78,35 +88,6 @@ def append_result(r: dict, results_path: Path) -> None:
 def append_summary(s: dict, results_path: Path) -> None:
     with open(results_path, "a") as f:
         f.write(json.dumps({"record_type": "summary", **s}) + "\n")
-
-
-def load_existing_results(results_path: Path) -> list[dict]:
-    if not results_path.exists():
-        return []
-
-    runs = []
-    with open(results_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if rec.pop("record_type", None) == "run":
-                runs.append(rec)
-    return runs
-
-
-def complete_seeds(runs: list[dict], cohort_names: list[str]) -> set[int]:
-    by_seed: dict[int, set[str]] = {}
-    for r in runs:
-        if r.get("target_heldout") is None:
-            continue
-        by_seed.setdefault(r["torch_seed"], set()).add(r["target_cohort"])
-    return {
-        seed
-        for seed, completed_targets in by_seed.items()
-        if completed_targets == set(cohort_names)
-    }
 
 
 def checkpoint_path_for(
@@ -226,8 +207,9 @@ def train_model_once(
     torch_seed: int,
     all_cohorts: dict,
     target_cohort: str,
-) -> tuple[HarmonizationModel, dict, list]:
-    target_harmonization, _ = split_target_cohort(
+    zscore_correction: bool = False,
+) -> tuple[HarmonizationModel, dict, list, list]:
+    target_harmonization, target_heldout = split_target_cohort(
         all_cohorts[target_cohort]
     )
 
@@ -255,6 +237,22 @@ def train_model_once(
 
         cohort_train[name] = train_p
         cohort_val[name] = val_p
+
+    if zscore_correction:
+        (
+            cohort_all,
+            cohort_train,
+            cohort_val,
+            target_harmonization,
+            target_heldout,
+        ) = normalize_split(
+            all_cohorts=all_cohorts,
+            cohort_train=cohort_train,
+            cohort_val=cohort_val,
+            target_cohort=target_cohort,
+            target_harmonization=target_harmonization,
+            target_heldout=target_heldout,
+        )
 
     torch.manual_seed(torch_seed)
     model = HarmonizationModel(
@@ -299,7 +297,7 @@ def train_model_once(
         checkpoint_path=None,
     )
 
-    return model, cohort_all, target_harmonization
+    return model, cohort_all, target_harmonization, target_heldout
 
 
 def get_or_train_model(
@@ -307,6 +305,8 @@ def get_or_train_model(
     all_cohorts: dict,
     target_cohort: str,
     load_dir: Path | None,
+    experiment: dict,
+    zscore_correction: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[HarmonizationModel, dict, list, list, bool]:
     target_harmonization, target_heldout = split_target_cohort(
@@ -316,7 +316,6 @@ def get_or_train_model(
         name: all_cohorts[name]
         for name in COHORT_NAMES
     }
-
     if load_dir is not None:
         ckpt_path = checkpoint_path_for(
             load_dir,
@@ -330,23 +329,56 @@ def get_or_train_model(
                 cohort_names=COHORT_NAMES,
                 latent_dim=64,
             )
-            model.load_state_dict(
-                torch.load(ckpt_path, map_location="cpu")
-            )
-            return (
-                model.to(device),
-                cohort_all,
-                target_harmonization,
-                target_heldout,
-                True,
-            )
+            payload = torch.load(ckpt_path, map_location="cpu")
+            if (
+                isinstance(payload, dict)
+                and payload.get("experiment_id") == experiment["experiment_id"]
+                and "state_dict" in payload
+            ):
+                if zscore_correction:
+                    source_train, source_val = {}, {}
+                    for name in COHORT_NAMES:
+                        patients = (
+                            target_harmonization
+                            if name == target_cohort
+                            else all_cohorts[name]
+                        )
+                        train_p, val_p = train_test_split(
+                            patients,
+                            test_size=0.2,
+                            random_state=VAL_SPLIT_SEED,
+                            stratify=(
+                                None
+                                if name == target_cohort
+                                else [p.label for p in patients]
+                            ),
+                        )
+                        source_train[name], source_val[name] = train_p, val_p
+                    (
+                        cohort_all,
+                        _,
+                        _,
+                        target_harmonization,
+                        target_heldout,
+                    ) = normalize_split(
+                        all_cohorts=all_cohorts,
+                        cohort_train=source_train,
+                        cohort_val=source_val,
+                        target_cohort=target_cohort,
+                        target_harmonization=target_harmonization,
+                        target_heldout=target_heldout,
+                    )
+                model.load_state_dict(payload["state_dict"])
+                return model.to(device), cohort_all, target_harmonization, target_heldout, True
+            print("  checkpoint provenance mismatch -- training")
 
         print(f"  no checkpoint at {ckpt_path} -- training")
 
-    model, cohort_all, target_harmonization = train_model_once(
+    model, cohort_all, target_harmonization, target_heldout = train_model_once(
         torch_seed,
         all_cohorts,
         target_cohort,
+        zscore_correction,
     )
 
     return (
@@ -395,61 +427,12 @@ def evaluate_target(
 def prepare_results(
     results_path: Path,
     fresh: bool,
+    experiment_id: str,
 ) -> tuple[list[dict], list[int]]:
-    existing_runs = [] if fresh else load_existing_results(results_path)
-
-    done_seeds = (
-        complete_seeds(existing_runs, COHORT_NAMES)
-        & set(TORCH_SEEDS)
+    return prepare_results_file(
+        path=results_path, fresh=fresh, experiment_id=experiment_id,
+        cohort_names=COHORT_NAMES, torch_seeds=TORCH_SEEDS,
     )
-
-    results = [
-        r
-        for r in existing_runs
-        if r["torch_seed"] in done_seeds
-    ]
-
-    discarded_seeds = {
-        r["torch_seed"]
-        for r in existing_runs
-    } - done_seeds
-
-    if discarded_seeds:
-        print(
-            f"discarding incomplete/outdated seed(s) found in "
-            f"{results_path}: {sorted(discarded_seeds)} "
-            f"(redoing from scratch)"
-        )
-
-    results_path.write_text("")
-
-    for r in results:
-        append_result(r, results_path)
-
-    seeds_to_run = [
-        seed
-        for seed in TORCH_SEEDS
-        if seed not in done_seeds
-    ]
-
-    if fresh:
-        print(
-            f"--fresh: running all {len(seeds_to_run)} seeds: "
-            f"{seeds_to_run}"
-        )
-    elif done_seeds:
-        print(
-            f"resuming: {len(done_seeds)} seed(s) already complete "
-            f"{sorted(done_seeds)}, running {len(seeds_to_run)} more: "
-            f"{seeds_to_run}"
-        )
-    else:
-        print(
-            f"no usable prior results -- running all "
-            f"{len(seeds_to_run)} seeds: {seeds_to_run}"
-        )
-
-    return results, seeds_to_run
 
 
 def run_combined(args: argparse.Namespace) -> None:
@@ -482,9 +465,33 @@ def run_combined(args: argparse.Namespace) -> None:
                 f"Available cohorts: {list(all_cohorts.keys())}"
             )
 
+    all_cohorts = {name: all_cohorts[name] for name in COHORT_NAMES}
+
+    metadata = experiment_metadata(
+        model="B3", data_path=data_path, cohort_names=COHORT_NAMES,
+        zscore_correction=args.zscore_correction,
+        parameters={
+            "latent_dim": 64, "batch_size": 16,
+            "n_epochs": N_EPOCHS, "lambda_mmd": LAMBDA_MMD,
+            "latent_gamma_mode": LATENT_GAMMA_MODE,
+            "decoder_freeze_epoch": DECODER_FREEZE_EPOCH, "patience": PATIENCE,
+            "alt_n_rounds": ALT_N_ROUNDS,
+            "alt_epochs_per_round": ALT_EPOCHS_PER_ROUND,
+            "alt_lambda_mmd": ALT_LAMBDA_MMD, "alt_lr": ALT_LR,
+            "pair_weighting": PAIR_WEIGHTING,
+            "target_pair_weight": TARGET_PAIR_WEIGHT,
+            "weighting_ema_beta": WEIGHTING_EMA_BETA,
+            "weighting_temperature": WEIGHTING_TEMPERATURE,
+            "weighting_floor": WEIGHTING_FLOOR, "weighting_ceil": WEIGHTING_CEIL,
+            "val_split_seed": VAL_SPLIT_SEED,
+            "target_holdout_seed": TARGET_HOLDOUT_SEED,
+        },
+        code_paths=[Path(__file__), Path(__file__).with_name("b_3.py")],
+    )
     results, seeds_to_run = prepare_results(
         results_path,
         args.fresh,
+        metadata["experiment_id"],
     )
 
     for torch_seed in seeds_to_run:
@@ -507,6 +514,8 @@ def run_combined(args: argparse.Namespace) -> None:
                 all_cohorts,
                 target_cohort,
                 load_dir,
+                metadata,
+                args.zscore_correction,
             )
 
             if was_loaded:
@@ -517,7 +526,12 @@ def run_combined(args: argparse.Namespace) -> None:
                     torch_seed,
                     target_cohort,
                 )
-                torch.save(model.state_dict(), ckpt_path)
+                torch.save(
+                    {"state_dict": model.state_dict(),
+                     "experiment_id": metadata["experiment_id"],
+                     "experiment": metadata},
+                    ckpt_path,
+                )
                 print(f"  saved checkpoint -> {ckpt_path}")
 
             r = evaluate_target(
@@ -528,6 +542,8 @@ def run_combined(args: argparse.Namespace) -> None:
                 target_harmonization,
                 target_heldout,
             )
+            r["experiment_id"] = metadata["experiment_id"]
+            r["experiment"] = metadata
 
             append_result(r, results_path)
             results.append(r)

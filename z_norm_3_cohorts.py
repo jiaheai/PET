@@ -6,30 +6,22 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+from sklearn.model_selection import train_test_split
 
+from experiment_utils import normalize_fold, pooled_masked_stats
 from nifti_loader import PatientVolumes, load_all_cohorts
 
 
 REFERENCE_COHORT = "SWISS"
 COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
+VAL_SPLIT_SEED = 40
+TARGET_HOLDOUT_SEED = 123
 
 
 def cohort_pooled_stats(
     patients: list[PatientVolumes],
 ) -> tuple[float, float]:
-    all_voxels = [p.pet[p.mask] for p in patients]
-    pooled = np.concatenate(all_voxels)
-
-    mu = float(pooled.mean())
-    sigma = float(pooled.std())
-
-    if sigma == 0:
-        raise ValueError(
-            f"pooled standard deviation is zero for cohort "
-            f"{patients[0].cohort!r}"
-        )
-
-    return mu, sigma
+    return pooled_masked_stats(patients)
 
 
 def zscore_match_patient(
@@ -104,8 +96,8 @@ def save_cohort(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Three-cohort AUGSBURG/PRE-RAPID/SWISS z-score matching "
-            "from one original dataset directory."
+            "Build one leakage-safe three-cohort normalization fold. Statistics "
+            "are fitted on source-training data and the target harmonization half."
         )
     )
     parser.add_argument(
@@ -114,12 +106,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default="CUBES-Labelled-COHORTS_ZSCORE_3COHORT",
+        default=None,
+        help="Output directory (default: derived from --target-cohort).",
+    )
+    parser.add_argument(
+        "--target-cohort",
+        required=True,
+        choices=COHORT_NAMES,
     )
     args = parser.parse_args()
 
     data_root = Path(args.data_dir)
-    output_root = Path(args.output_dir)
+    output_root = Path(
+        args.output_dir
+        or f"CUBES-Labelled-COHORTS_ZSCORE_3COHORT_target-{args.target_cohort}"
+    )
 
     print(f"Loading original dataset from {data_root} ...")
     all_cohorts = load_all_cohorts(data_root)
@@ -140,50 +141,47 @@ def main() -> None:
     for cohort_name in COHORT_NAMES:
         print(f"  {cohort_name}")
 
-    stats: dict[str, tuple[float, float]] = {}
-
-    print("\nFitting statistics from each full cohort:")
+    fit_patients: dict[str, list[PatientVolumes]] = {}
+    print("\nFitting statistics from allowed fold data:")
     for cohort_name in COHORT_NAMES:
-        mu, sigma = cohort_pooled_stats(cohorts[cohort_name])
-        stats[cohort_name] = (mu, sigma)
+        patients = cohorts[cohort_name]
+        if cohort_name == args.target_cohort:
+            fit, _ = train_test_split(
+                patients,
+                test_size=0.5,
+                random_state=TARGET_HOLDOUT_SEED,
+                stratify=[patient.label for patient in patients],
+            )
+        else:
+            fit, _ = train_test_split(
+                patients,
+                test_size=0.2,
+                random_state=VAL_SPLIT_SEED,
+                stratify=[patient.label for patient in patients],
+            )
+        fit_patients[cohort_name] = fit
+        mu, sigma = cohort_pooled_stats(fit)
 
         print(
             f"  {cohort_name:12s} "
-            f"mu={mu:.6f}  sigma={sigma:.6f}"
+            f"n_fit={len(fit):3d}  mu={mu:.6f}  sigma={sigma:.6f}"
         )
 
-    reference_mu, reference_sigma = stats[REFERENCE_COHORT]
-
-    print(
-        f"\nReference cohort: {REFERENCE_COHORT}"
-    )
-    print(
-        f"reference mu={reference_mu:.6f}  "
-        f"sigma={reference_sigma:.6f}"
-    )
+    normalized = normalize_fold(cohorts, fit_patients, REFERENCE_COHORT)
+    print(f"\nReference cohort: {REFERENCE_COHORT}")
 
     for cohort_name in COHORT_NAMES:
-        own_mu, own_sigma = stats[cohort_name]
-
         print(
             f"\nTransforming {cohort_name} ..."
         )
 
-        transformed = transform_cohort(
-            cohorts[cohort_name],
-            own_mu,
-            own_sigma,
-            reference_mu,
-            reference_sigma,
-        )
-
         save_cohort(
-            transformed,
+            normalized[cohort_name],
             output_root,
         )
 
         print(
-            f"  saved={len(transformed)}"
+            f"  saved={len(normalized[cohort_name])}"
         )
 
     print(

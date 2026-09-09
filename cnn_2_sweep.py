@@ -2,9 +2,9 @@
 
 For each target cohort, one CNN is trained on labeled patients from the two
 source cohorts. The target cohort is split 50/50 with TARGET_HOLDOUT_SEED=123
-to preserve the same held-out membership used by A2/B2/C2, but CNN2 does not
-train on either target half. The harmonization half is reported only as a
-diagnostic; target_heldout is the final evaluation.
+to preserve the same held-out membership used by A2/B2/C2. CNN2 model weights
+never use target labels or images; when correction is enabled,
+the harmonization half fits only the unsupervised normalization statistics.
 """
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 
+from experiment_utils import (
+    experiment_metadata,
+    normalize_split,
+    prepare_results_file,
+)
 from cnn_2 import (
     CNNClassifier3D,
     eval_on,
@@ -62,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wipe --results-path and rerun every seed from scratch.",
     )
+    parser.add_argument(
+        "--zscore-correction",
+        action="store_true",
+        help="Fit cohort normalization within each target fold.",
+    )
     return parser.parse_args()
 
 
@@ -97,58 +107,6 @@ def append_summary(
         )
 
 
-def load_existing_results(
-    results_path: Path,
-) -> list[dict]:
-    if not results_path.exists():
-        return []
-
-    runs = []
-
-    with open(results_path) as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            rec = json.loads(line)
-
-            if rec.pop(
-                "record_type",
-                None,
-            ) == "run":
-                runs.append(rec)
-
-    return runs
-
-
-def complete_seeds(
-    runs: list[dict],
-    cohort_names: list[str],
-) -> set[int]:
-    by_seed: dict[int, set[str]] = {}
-
-    for result in runs:
-        if result.get(
-            "target_heldout"
-        ) is None:
-            continue
-
-        by_seed.setdefault(
-            result["torch_seed"],
-            set(),
-        ).add(
-            result["target_cohort"]
-        )
-
-    return {
-        seed
-        for seed, completed_targets in by_seed.items()
-        if completed_targets == set(cohort_names)
-    }
-
-
 def split_target_cohort(
     patients: list,
 ) -> tuple[list, list]:
@@ -181,8 +139,10 @@ def train_model_once(
     torch_seed: int,
     all_cohorts: dict,
     target_cohort: str,
+    zscore_correction: bool = False,
 ) -> tuple[
     CNNClassifier3D,
+    dict,
     list[str],
     list,
     list,
@@ -199,8 +159,8 @@ def train_model_once(
         if name != target_cohort
     ]
 
-    source_train = []
-    source_val = []
+    cohort_train = {}
+    cohort_val = {}
 
     for name in source_cohorts:
         train_patients, val_patients = (
@@ -209,12 +169,36 @@ def train_model_once(
             )
         )
 
-        source_train.extend(
-            train_patients
+        cohort_train[name] = train_patients
+        cohort_val[name] = val_patients
+
+    # The target harmonization half is allowed to fit unsupervised correction;
+    # the held-out half is transformed only after all statistics are frozen.
+    cohort_train[target_cohort] = []
+    cohort_val[target_cohort] = []
+    prepared_cohorts = all_cohorts
+    if zscore_correction:
+        (
+            prepared_cohorts,
+            cohort_train,
+            cohort_val,
+            target_harmonization,
+            target_heldout,
+        ) = normalize_split(
+            all_cohorts=all_cohorts,
+            cohort_train=cohort_train,
+            cohort_val=cohort_val,
+            target_cohort=target_cohort,
+            target_harmonization=target_harmonization,
+            target_heldout=target_heldout,
         )
-        source_val.extend(
-            val_patients
-        )
+
+    source_train = [
+        patient for name in source_cohorts for patient in cohort_train[name]
+    ]
+    source_val = [
+        patient for name in source_cohorts for patient in cohort_val[name]
+    ]
 
     torch.manual_seed(
         torch_seed
@@ -239,6 +223,7 @@ def train_model_once(
 
     return (
         model,
+        prepared_cohorts,
         source_cohorts,
         target_harmonization,
         target_heldout,
@@ -368,84 +353,17 @@ def summarize(
 def prepare_results(
     results_path: Path,
     fresh: bool,
+    experiment_id: str,
 ) -> tuple[
     list[dict],
     list[int],
 ]:
-    existing_runs = (
-        []
-        if fresh
-        else load_existing_results(
-            results_path
-        )
-    )
-
-    done_seeds = (
-        complete_seeds(
-            existing_runs,
-            COHORT_NAMES,
-        )
-        & set(TORCH_SEEDS)
-    )
-
-    results = [
-        result
-        for result in existing_runs
-        if result["torch_seed"] in done_seeds
-    ]
-
-    discarded_seeds = {
-        result["torch_seed"]
-        for result in existing_runs
-    } - done_seeds
-
-    if discarded_seeds:
-        print(
-            f"discarding incomplete/outdated "
-            f"seed(s) found in {results_path}: "
-            f"{sorted(discarded_seeds)} "
-            f"(redoing from scratch)"
-        )
-
-    results_path.write_text("")
-
-    for result in results:
-        append_result(
-            result,
-            results_path,
-        )
-
-    seeds_to_run = [
-        seed
-        for seed in TORCH_SEEDS
-        if seed not in done_seeds
-    ]
-
-    if fresh:
-        print(
-            f"--fresh: running all "
-            f"{len(seeds_to_run)} seeds: "
-            f"{seeds_to_run}"
-        )
-    elif done_seeds:
-        print(
-            f"resuming: {len(done_seeds)} "
-            f"seed(s) already complete "
-            f"{sorted(done_seeds)}, running "
-            f"{len(seeds_to_run)} more: "
-            f"{seeds_to_run}"
-        )
-    else:
-        print(
-            f"no usable prior results -- "
-            f"running all "
-            f"{len(seeds_to_run)} seeds: "
-            f"{seeds_to_run}"
-        )
-
-    return (
-        results,
-        seeds_to_run,
+    return prepare_results_file(
+        path=results_path,
+        fresh=fresh,
+        experiment_id=experiment_id,
+        cohort_names=COHORT_NAMES,
+        torch_seeds=TORCH_SEEDS,
     )
 
 
@@ -473,8 +391,9 @@ def run_sweep(
         f"torch seeds  : {TORCH_SEEDS}"
     )
     print(
-        "target harmonization half is "
-        "never used for CNN training"
+        "target harmonization half is used only to fit unsupervised correction"
+        if args.zscore_correction
+        else "target cohort is never used for CNN training"
     )
 
     all_cohorts = load_all_cohorts(
@@ -489,10 +408,31 @@ def run_sweep(
                 f"{list(all_cohorts.keys())}"
             )
 
+    all_cohorts = {name: all_cohorts[name] for name in COHORT_NAMES}
+
+    metadata = experiment_metadata(
+        model="CNN2",
+        data_path=data_path,
+        cohort_names=COHORT_NAMES,
+        zscore_correction=args.zscore_correction,
+        parameters={
+            "latent_dim": LATENT_DIM,
+            "dropout": DROPOUT,
+            "n_epochs": N_EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "lr": LR,
+            "weight_decay": WEIGHT_DECAY,
+            "patience": PATIENCE,
+            "val_split_seed": VAL_SPLIT_SEED,
+            "target_holdout_seed": TARGET_HOLDOUT_SEED,
+        },
+        code_paths=[Path(__file__), Path(__file__).with_name("cnn_2.py")],
+    )
     results, seeds_to_run = (
         prepare_results(
             results_path,
             args.fresh,
+            metadata["experiment_id"],
         )
     )
 
@@ -502,13 +442,13 @@ def run_sweep(
                 f"\n{'=' * 60}\n"
                 f"TORCH SEED {torch_seed}  "
                 f"target={target_cohort}  "
-                f"(target entirely excluded "
-                f"from training)\n"
+                f"(target held-out half entirely excluded)\n"
                 f"{'=' * 60}"
             )
 
             (
                 model,
+                prepared_cohorts,
                 source_cohorts,
                 target_harmonization,
                 target_heldout,
@@ -516,17 +456,20 @@ def run_sweep(
                 torch_seed,
                 all_cohorts,
                 target_cohort,
+                args.zscore_correction,
             )
 
             result = evaluate_target(
                 torch_seed,
                 model,
-                all_cohorts,
+                prepared_cohorts,
                 target_cohort,
                 source_cohorts,
                 target_harmonization,
                 target_heldout,
             )
+            result["experiment_id"] = metadata["experiment_id"]
+            result["experiment"] = metadata
 
             append_result(
                 result,

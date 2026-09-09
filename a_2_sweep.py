@@ -17,6 +17,11 @@ import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 
+from experiment_utils import (
+    experiment_metadata,
+    normalize_split,
+    prepare_results_file,
+)
 from a_2 import (
     HarmonizationModel,
     train_harmonization,
@@ -61,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH)
     parser.add_argument("--results-path", default=DEFAULT_RESULTS_PATH)
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument(
+        "--zscore-correction",
+        action="store_true",
+        help="Fit cohort normalization within each target fold.",
+    )
     return parser.parse_args()
 
 
@@ -140,6 +151,7 @@ def train_model_once(
     torch_seed: int,
     all_cohorts: dict,
     target_cohort: str,
+    zscore_correction: bool = False,
 ) -> tuple[HarmonizationModel, dict, list, list]:
     target_harmonization, target_heldout = split_target_cohort(
         all_cohorts[target_cohort]
@@ -169,6 +181,22 @@ def train_model_once(
 
         cohort_train[name] = train_p
         cohort_val[name] = val_p
+
+    if zscore_correction:
+        (
+            cohort_all,
+            cohort_train,
+            cohort_val,
+            target_harmonization,
+            target_heldout,
+        ) = normalize_split(
+            all_cohorts=all_cohorts,
+            cohort_train=cohort_train,
+            cohort_val=cohort_val,
+            target_cohort=target_cohort,
+            target_harmonization=target_harmonization,
+            target_heldout=target_heldout,
+        )
 
     torch.manual_seed(torch_seed)
 
@@ -307,10 +335,43 @@ if __name__ == "__main__":
         for name in COHORT_NAMES
     }
 
-    results_path.write_text("")
-    results = []
+    metadata = experiment_metadata(
+        model="A2",
+        data_path=data_path,
+        cohort_names=COHORT_NAMES,
+        zscore_correction=args.zscore_correction,
+        parameters={
+            "latent_dim": LATENT_DIM,
+            "batch_size": BATCH_SIZE,
+            "n_epochs": N_EPOCHS,
+            "lambda_mmd": LAMBDA_MMD,
+            "latent_gamma_mode": LATENT_GAMMA_MODE,
+            "decoder_freeze_epoch": DECODER_FREEZE_EPOCH,
+            "patience": PATIENCE,
+            "alt_n_rounds": ALT_N_ROUNDS,
+            "alt_epochs_per_round": ALT_EPOCHS_PER_ROUND,
+            "alt_lambda_mmd": ALT_LAMBDA_MMD,
+            "alt_lr": ALT_LR,
+            "pair_weighting": PAIR_WEIGHTING,
+            "target_pair_weight": TARGET_PAIR_WEIGHT,
+            "weighting_ema_beta": WEIGHTING_EMA_BETA,
+            "weighting_temperature": WEIGHTING_TEMPERATURE,
+            "weighting_floor": WEIGHTING_FLOOR,
+            "weighting_ceil": WEIGHTING_CEIL,
+            "val_split_seed": VAL_SPLIT_SEED,
+            "target_holdout_seed": TARGET_HOLDOUT_SEED,
+        },
+        code_paths=[Path(__file__), Path(__file__).with_name("a_2.py")],
+    )
+    results, seeds_to_run = prepare_results_file(
+        path=results_path,
+        fresh=args.fresh,
+        experiment_id=metadata["experiment_id"],
+        cohort_names=COHORT_NAMES,
+        torch_seeds=TORCH_SEEDS,
+    )
 
-    for torch_seed in TORCH_SEEDS:
+    for torch_seed in seeds_to_run:
         for target_cohort in COHORT_NAMES:
             print(
                 f"\n{'=' * 60}\n"
@@ -322,8 +383,8 @@ if __name__ == "__main__":
                 torch_seed,
                 all_cohorts,
                 target_cohort,
+                args.zscore_correction,
             )
-
             r = evaluate_target(
                 torch_seed,
                 model,
@@ -332,6 +393,8 @@ if __name__ == "__main__":
                 target_harm,
                 target_heldout,
             )
+            r["experiment_id"] = metadata["experiment_id"]
+            r["experiment"] = metadata
 
             append_result(r, results_path)
             results.append(r)

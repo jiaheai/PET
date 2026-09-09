@@ -4,7 +4,7 @@ One independent autoencoder is trained per cohort. The source-cohort
 autoencoder uses the full source cohort; the target-cohort autoencoder uses
 only the target harmonization half. Every patient is encoded by both
 encoders and the two latent vectors are concatenated before fitting one
-source-only StandardScaler + LogisticRegression classifier.
+source-training-only StandardScaler + LogisticRegression classifier.
 
 The target cohort is split 50/50 with TARGET_HOLDOUT_SEED=123. The target
 held-out half never touches autoencoder training or classifier fitting.
@@ -24,6 +24,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from experiment_utils import (
+    experiment_metadata,
+    normalize_split,
+    prepare_results_file,
+)
 from c_2 import Autoencoder3D, Encoder3D, encode_concat, train_autoencoder
 from nifti_loader import load_all_cohorts
 
@@ -60,6 +65,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wipe --results-path and rerun every seed from scratch.",
     )
+    parser.add_argument(
+        "--zscore-correction",
+        action="store_true",
+        help="Fit cohort normalization within each target fold.",
+    )
     return parser.parse_args()
 
 
@@ -71,49 +81,6 @@ def append_result(r: dict, results_path: Path) -> None:
 def append_summary(s: dict, results_path: Path) -> None:
     with open(results_path, "a") as f:
         f.write(json.dumps({"record_type": "summary", **s}) + "\n")
-
-
-def load_existing_results(results_path: Path) -> list[dict]:
-    if not results_path.exists():
-        return []
-
-    runs = []
-
-    with open(results_path) as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            rec = json.loads(line)
-
-            if rec.pop("record_type", None) == "run":
-                runs.append(rec)
-
-    return runs
-
-
-def complete_seeds(
-    runs: list[dict],
-    cohort_names: list[str],
-) -> set[int]:
-    by_seed: dict[int, set[str]] = {}
-
-    for r in runs:
-        if r.get("target_heldout") is None:
-            continue
-
-        by_seed.setdefault(
-            r["torch_seed"],
-            set(),
-        ).add(r["target_cohort"])
-
-    return {
-        seed
-        for seed, completed_targets in by_seed.items()
-        if completed_targets == set(cohort_names)
-    }
 
 
 def split_target_cohort(patients: list) -> tuple[list, list]:
@@ -178,7 +145,8 @@ def train_model_once(
     torch_seed: int,
     all_cohorts: dict,
     target_cohort: str,
-) -> tuple[dict[str, Encoder3D], list[str], list, list]:
+    zscore_correction: bool = False,
+) -> tuple[dict[str, Encoder3D], dict, list[str], list, list, list]:
     target_harmonization, target_heldout = split_target_cohort(
         all_cohorts[target_cohort]
     )
@@ -196,12 +164,10 @@ def train_model_once(
         target_cohort: target_harmonization,
     }
 
-    encoders: dict[str, Encoder3D] = {}
-
-    for i, name in enumerate(COHORT_NAMES):
+    cohort_train, cohort_val = {}, {}
+    for name in COHORT_NAMES:
         pool = training_pools[name]
         is_target = name == target_cohort
-
         train_p, val_p = train_test_split(
             pool,
             test_size=0.2,
@@ -212,6 +178,27 @@ def train_model_once(
                 else [p.label for p in pool]
             ),
         )
+        cohort_train[name], cohort_val[name] = train_p, val_p
+
+    prepared_cohorts = all_cohorts
+    if zscore_correction:
+        (
+            prepared_cohorts,
+            cohort_train,
+            cohort_val,
+            target_harmonization,
+            target_heldout,
+        ) = normalize_split(
+            all_cohorts=all_cohorts,
+            cohort_train=cohort_train,
+            cohort_val=cohort_val,
+            target_cohort=target_cohort,
+            target_harmonization=target_harmonization,
+            target_heldout=target_heldout,
+        )
+
+    encoders: dict[str, Encoder3D] = {}
+    for i, name in enumerate(COHORT_NAMES):
 
         torch.manual_seed(
             torch_seed + i * SEED_OFFSET
@@ -222,8 +209,8 @@ def train_model_once(
         )
         model = train_autoencoder(
             model,
-            train_p,
-            val_p,
+            cohort_train[name],
+            cohort_val[name],
             n_epochs=N_EPOCHS,
             checkpoint_path=None,
             label=(
@@ -237,7 +224,9 @@ def train_model_once(
 
     return (
         encoders,
+        prepared_cohorts,
         source_cohorts,
+        [patient for name in source_cohorts for patient in cohort_train[name]],
         target_harmonization,
         target_heldout,
     )
@@ -249,6 +238,7 @@ def evaluate_target(
     all_cohorts: dict,
     target_cohort: str,
     source_cohorts: list[str],
+    classifier_train: list,
     target_harmonization: list,
     target_heldout: list,
 ) -> dict:
@@ -262,6 +252,11 @@ def evaluate_target(
         encoders,
         COHORT_NAMES,
         source_patients,
+    )
+    Z_classifier_train, y_classifier_train = encode_concat(
+        encoders,
+        COHORT_NAMES,
+        classifier_train,
     )
     Z_target_harm, y_target_harm = encode_concat(
         encoders,
@@ -282,8 +277,8 @@ def evaluate_target(
         ),
     )
     clf.fit(
-        Z_source,
-        y_source,
+        Z_classifier_train,
+        y_classifier_train,
     )
 
     prob_source = clf.predict_proba(
@@ -379,81 +374,11 @@ def summarize(
 def prepare_results(
     results_path: Path,
     fresh: bool,
+    experiment_id: str,
 ) -> tuple[list[dict], list[int]]:
-    existing_runs = (
-        []
-        if fresh
-        else load_existing_results(
-            results_path
-        )
-    )
-
-    done_seeds = (
-        complete_seeds(
-            existing_runs,
-            COHORT_NAMES,
-        )
-        & set(TORCH_SEEDS)
-    )
-
-    results = [
-        r
-        for r in existing_runs
-        if r["torch_seed"] in done_seeds
-    ]
-
-    discarded_seeds = {
-        r["torch_seed"]
-        for r in existing_runs
-    } - done_seeds
-
-    if discarded_seeds:
-        print(
-            f"discarding incomplete/outdated "
-            f"seed(s) found in {results_path}: "
-            f"{sorted(discarded_seeds)} "
-            f"(redoing from scratch)"
-        )
-
-    results_path.write_text("")
-
-    for r in results:
-        append_result(
-            r,
-            results_path,
-        )
-
-    seeds_to_run = [
-        seed
-        for seed in TORCH_SEEDS
-        if seed not in done_seeds
-    ]
-
-    if fresh:
-        print(
-            f"--fresh: running all "
-            f"{len(seeds_to_run)} seeds: "
-            f"{seeds_to_run}"
-        )
-    elif done_seeds:
-        print(
-            f"resuming: {len(done_seeds)} "
-            f"seed(s) already complete "
-            f"{sorted(done_seeds)}, running "
-            f"{len(seeds_to_run)} more: "
-            f"{seeds_to_run}"
-        )
-    else:
-        print(
-            f"no usable prior results -- "
-            f"running all "
-            f"{len(seeds_to_run)} seeds: "
-            f"{seeds_to_run}"
-        )
-
-    return (
-        results,
-        seeds_to_run,
+    return prepare_results_file(
+        path=results_path, fresh=fresh, experiment_id=experiment_id,
+        cohort_names=COHORT_NAMES, torch_seeds=TORCH_SEEDS,
     )
 
 
@@ -493,9 +418,22 @@ def run_sweep(
                 f"{list(all_cohorts.keys())}"
             )
 
+    all_cohorts = {name: all_cohorts[name] for name in COHORT_NAMES}
+
+    metadata = experiment_metadata(
+        model="C2", data_path=data_path, cohort_names=COHORT_NAMES,
+        zscore_correction=args.zscore_correction,
+        parameters={
+            "n_epochs": N_EPOCHS, "latent_dim": LATENT_DIM,
+            "seed_offset": SEED_OFFSET, "val_split_seed": VAL_SPLIT_SEED,
+            "target_holdout_seed": TARGET_HOLDOUT_SEED,
+        },
+        code_paths=[Path(__file__), Path(__file__).with_name("c_2.py")],
+    )
     results, seeds_to_run = prepare_results(
         results_path,
         args.fresh,
+        metadata["experiment_id"],
     )
 
     for torch_seed in seeds_to_run:
@@ -511,24 +449,30 @@ def run_sweep(
 
             (
                 encoders,
+                prepared_cohorts,
                 source_cohorts,
+                classifier_train,
                 target_harmonization,
                 target_heldout,
             ) = train_model_once(
                 torch_seed,
                 all_cohorts,
                 target_cohort,
+                args.zscore_correction,
             )
 
             r = evaluate_target(
                 torch_seed,
                 encoders,
-                all_cohorts,
+                prepared_cohorts,
                 target_cohort,
                 source_cohorts,
+                classifier_train,
                 target_harmonization,
                 target_heldout,
             )
+            r["experiment_id"] = metadata["experiment_id"]
+            r["experiment"] = metadata
 
             append_result(
                 r,
