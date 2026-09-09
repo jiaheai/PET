@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import platform
 import random
 from copy import copy
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import numpy as np
 import torch
@@ -23,19 +20,19 @@ REFERENCE_COHORT = "SWISS"
 
 
 def seed_everything(seed: int) -> None:
-    """Seed all RNGs and require deterministic PyTorch execution."""
+    """Seed all RNGs while retaining fast CUDA/cuDNN execution."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
     if hasattr(torch.backends, "cuda"):
-        torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def _package_versions() -> dict[str, str]:
@@ -293,11 +290,10 @@ def experiment_metadata(
         "zscore_correction": zscore_correction,
         "parameters": parameters,
         "determinism": {
-            "enabled": True,
-            "cublas_workspace_config": os.environ.get(
-                "CUBLAS_WORKSPACE_CONFIG", ":4096:8"
-            ),
-            "allow_tf32": False,
+            "enabled": False,
+            "rng_seeded": True,
+            "cudnn_benchmark": True,
+            "allow_tf32": True,
         },
         "runtime_versions": _package_versions(),
     }

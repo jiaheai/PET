@@ -116,9 +116,11 @@ class RepositoryConfigurationTests(unittest.TestCase):
         self.assertEqual(first[0], second[0])
         self.assertEqual(first[1], second[1])
         torch.testing.assert_close(first[2], second[2], rtol=0, atol=0)
-        self.assertTrue(torch.are_deterministic_algorithms_enabled())
-        self.assertTrue(torch.backends.cudnn.deterministic)
-        self.assertFalse(torch.backends.cudnn.benchmark)
+        self.assertFalse(torch.are_deterministic_algorithms_enabled())
+        self.assertFalse(torch.backends.cudnn.deterministic)
+        self.assertTrue(torch.backends.cudnn.benchmark)
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+        self.assertTrue(torch.backends.cudnn.allow_tf32)
 
     def test_shared_batchnorm_is_cohort_order_neutral(self) -> None:
         cohort_a = torch.zeros(2, 1, 32, 32, 32)
