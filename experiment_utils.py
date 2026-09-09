@@ -4,17 +4,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
+import random
 from copy import copy
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
+import torch
 
 from nifti_loader import PatientVolumes
 
 
 REFERENCE_COHORT = "SWISS"
+
+
+def seed_everything(seed: int) -> None:
+    """Seed all RNGs and require deterministic PyTorch execution."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def _package_versions() -> dict[str, str]:
@@ -65,7 +86,10 @@ def prepare_results_file(
     experiment_id: str,
     cohort_names: list[str],
     torch_seeds: list[int],
+    experiment: dict | None = None,
 ) -> tuple[list[dict], list[int]]:
+    if experiment is not None and experiment.get("experiment_id") != experiment_id:
+        raise ValueError("Experiment manifest ID does not match experiment_id.")
     runs, stale_count = (
         ([], 0)
         if fresh
@@ -97,6 +121,8 @@ def prepare_results_file(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("")
+    if experiment is not None:
+        append_jsonl_record(path, "experiment", experiment)
     for run in kept:
         append_jsonl_record(path, "run", run)
 
@@ -266,6 +292,13 @@ def experiment_metadata(
         "cohorts": cohort_names,
         "zscore_correction": zscore_correction,
         "parameters": parameters,
+        "determinism": {
+            "enabled": True,
+            "cublas_workspace_config": os.environ.get(
+                "CUBLAS_WORKSPACE_CONFIG", ":4096:8"
+            ),
+            "allow_tf32": False,
+        },
         "runtime_versions": _package_versions(),
     }
     encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()

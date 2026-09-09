@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from experiment_utils import seed_everything
 
 
 DATA_PATH          = "CUBES-Labelled-COHORTS_2"
@@ -52,7 +53,7 @@ class Decoder3D(nn.Module):
             nn.BatchNorm3d(16),
             nn.ReLU(inplace=True),
             nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.Identity(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -731,7 +732,7 @@ if __name__ == "__main__":
         cohort_train[name] = train_p
         cohort_val[name] = val_p
         print(f"{name:12s}: {len(train_p)} train / {len(val_p)} val  (all {len(patients)} used)")
-    torch.manual_seed(41)
+    seed_everything(41)
     model = HarmonizationModel(cohort_names=COHORT_NAMES, latent_dim=32)
     checkpoint_name = f"best_harmonization_multi_target-{TARGET_COHORT or 'none'}.pt"
     model = train_harmonization_multi(

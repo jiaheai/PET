@@ -1,8 +1,8 @@
-numpy
-pandas
-scipy
-scikit-learn
-torch
-joblib
-matplotlib
-nibabel
+numpy==2.5.1
+pandas==3.0.3
+scipy==1.18.0
+scikit-learn==1.9.0
+torch==2.13.0
+joblib==1.5.3
+matplotlib==3.11.0
+nibabel==5.4.2

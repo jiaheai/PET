@@ -15,6 +15,7 @@ from experiment_utils import (
     experiment_metadata,
     normalize_split,
     prepare_results_file,
+    seed_everything,
 )
 from b_3 import (
     HarmonizationModel,
@@ -24,7 +25,7 @@ from b_3 import (
 from nifti_loader import load_all_cohorts
 
 
-DEFAULT_DATA_PATH = "CUBES-Labelled-COHORTS"
+DEFAULT_DATA_PATH = "CUBES-Labelled-COHORTS_3"
 DEFAULT_RESULTS_PATH = "b_3.jsonl"
 
 COHORT_NAMES = ['AUGSBURG', 'PRE-RAPID', 'SWISS']
@@ -254,7 +255,7 @@ def train_model_once(
             target_heldout=target_heldout,
         )
 
-    torch.manual_seed(torch_seed)
+    seed_everything(torch_seed)
     model = HarmonizationModel(
         cohort_names=COHORT_NAMES,
         latent_dim=64,
@@ -427,11 +428,13 @@ def evaluate_target(
 def prepare_results(
     results_path: Path,
     fresh: bool,
-    experiment_id: str,
+    experiment: dict,
 ) -> tuple[list[dict], list[int]]:
     return prepare_results_file(
-        path=results_path, fresh=fresh, experiment_id=experiment_id,
+        path=results_path, fresh=fresh,
+        experiment_id=experiment["experiment_id"],
         cohort_names=COHORT_NAMES, torch_seeds=TORCH_SEEDS,
+        experiment=experiment,
     )
 
 
@@ -491,7 +494,7 @@ def run_combined(args: argparse.Namespace) -> None:
     results, seeds_to_run = prepare_results(
         results_path,
         args.fresh,
-        metadata["experiment_id"],
+        metadata,
     )
 
     for torch_seed in seeds_to_run:

@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
-DATA_PATH = "CUBES-Labelled-COHORTS"
+DATA_PATH = "CUBES-Labelled-COHORTS_3"
 COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
 
 
@@ -62,7 +62,7 @@ class Decoder3D(nn.Module):
             nn.ReLU(inplace=True),
 
             nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.Identity(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:

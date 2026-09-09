@@ -48,14 +48,39 @@ def load_patient(pet_path: Path, mask_path: Path) -> PatientVolumes:
     pet_data = np.asarray(pet_img.dataobj, dtype=np.float32)
     mask_data = np.asarray(mask_img.dataobj, dtype=np.float32)
 
+    if pet_data.ndim != 3 or mask_data.ndim != 3:
+        raise ValueError(
+            f"PET and mask must both be 3-D for {pet_path.name}; "
+            f"got {pet_data.shape} and {mask_data.shape}."
+        )
+    if pet_data.shape != mask_data.shape:
+        raise ValueError(
+            f"PET/mask shape mismatch for {pet_path.name}: "
+            f"{pet_data.shape} != {mask_data.shape}."
+        )
+    if not np.isfinite(pet_data).all():
+        raise ValueError(f"PET contains non-finite values: {pet_path}")
+    if not np.isfinite(mask_data).all():
+        raise ValueError(f"Mask contains non-finite values: {mask_path}")
+    if not np.isfinite(pet_img.affine).all() or not np.isfinite(mask_img.affine).all():
+        raise ValueError(f"PET or mask affine contains non-finite values: {pet_path}")
+    if not np.allclose(pet_img.affine, mask_img.affine, rtol=1e-5, atol=1e-5):
+        raise ValueError(f"PET/mask affine mismatch for {pet_path.name}.")
+
     # Binarise mask (tolerant of soft/probabilistic masks)
     binary_mask = mask_data > 0.5
+    if not binary_mask.any():
+        raise ValueError(f"Mask is empty after binarisation: {mask_path}")
 
     pet_masked = pet_data * binary_mask
 
     patient_id = _patient_id_from_path(pet_path)
     cohort = pet_path.parent.name
     label = _label_from_path(pet_path)
+    if label not in (None, 0, 1):
+        raise ValueError(
+            f"Expected a binary risk label (0 or 1), got {label} in {pet_path.name}."
+        )
 
     return PatientVolumes(
         patient_id=patient_id,
@@ -76,6 +101,17 @@ def load_cohort(cohort_dir: str | Path) -> list[PatientVolumes]:
     pet_files = sorted(cohort_dir.glob("*_PET_*.nii.gz"))
     if not pet_files:
         raise FileNotFoundError(f"No PET files found in {cohort_dir}")
+
+    patient_ids = [_patient_id_from_path(path) for path in pet_files]
+    duplicate_ids = sorted(
+        patient_id
+        for patient_id in set(patient_ids)
+        if patient_ids.count(patient_id) > 1
+    )
+    if duplicate_ids:
+        raise ValueError(
+            f"Duplicate patient ID(s) in {cohort_dir}: {', '.join(duplicate_ids)}"
+        )
 
     patients: list[PatientVolumes] = []
     missing: list[str] = []

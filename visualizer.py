@@ -33,7 +33,7 @@ import numpy as np
 
 from nifti_loader import PatientVolumes, load_cohort
 
-DATA_ROOT       = Path(__file__).parent / "CUBES-Labelled-COHORTS"
+DATA_ROOT       = Path(__file__).parent / "CUBES-Labelled-COHORTS_3"
 RECON_ROOT      = Path(__file__).parent / "reconstructions"
 HARMONIZED_ROOT = Path(__file__).parent / "harmonized_reconstructions"
 

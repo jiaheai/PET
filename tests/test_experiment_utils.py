@@ -117,6 +117,7 @@ class ProvenanceTests(unittest.TestCase):
                 "target_heldout": {"auc": 0.5},
             }
             stale = {**good, "experiment_id": "old"}
+            manifest = {"experiment_id": "current", "model": "test"}
             path.write_text(json.dumps(good) + "\n" + json.dumps(stale) + "\n")
 
             kept, pending = prepare_results_file(
@@ -125,9 +126,13 @@ class ProvenanceTests(unittest.TestCase):
                 experiment_id="current",
                 cohort_names=["AUGSBURG"],
                 torch_seeds=[0],
+                experiment=manifest,
             )
             self.assertEqual(len(kept), 1)
             self.assertEqual(pending, [])
+            first_record = json.loads(path.read_text().splitlines()[0])
+            self.assertEqual(first_record["record_type"], "experiment")
+            self.assertEqual(first_record["experiment_id"], "current")
 
             with path.open("a") as handle:
                 handle.write(json.dumps(good) + "\n")
@@ -137,6 +142,7 @@ class ProvenanceTests(unittest.TestCase):
                 experiment_id="current",
                 cohort_names=["AUGSBURG"],
                 torch_seeds=[0],
+                experiment=manifest,
             )
             self.assertEqual(kept, [])
             self.assertEqual(pending, [0])

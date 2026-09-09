@@ -1,7 +1,7 @@
 """Approach C2 leave-one-cohort-out sweep across AUGSBURG and SWISS.
 
 One independent autoencoder is trained per cohort. The source-cohort
-autoencoder uses the full source cohort; the target-cohort autoencoder uses
+autoencoder uses its source-training split; the target-cohort autoencoder uses
 only the target harmonization half. Every patient is encoded by both
 encoders and the two latent vectors are concatenated before fitting one
 source-training-only StandardScaler + LogisticRegression classifier.
@@ -28,6 +28,7 @@ from experiment_utils import (
     experiment_metadata,
     normalize_split,
     prepare_results_file,
+    seed_everything,
 )
 from c_2 import Autoencoder3D, Encoder3D, encode_concat, train_autoencoder
 from nifti_loader import load_all_cohorts
@@ -200,7 +201,7 @@ def train_model_once(
     encoders: dict[str, Encoder3D] = {}
     for i, name in enumerate(COHORT_NAMES):
 
-        torch.manual_seed(
+        seed_everything(
             torch_seed + i * SEED_OFFSET
         )
 
@@ -374,11 +375,13 @@ def summarize(
 def prepare_results(
     results_path: Path,
     fresh: bool,
-    experiment_id: str,
+    experiment: dict,
 ) -> tuple[list[dict], list[int]]:
     return prepare_results_file(
-        path=results_path, fresh=fresh, experiment_id=experiment_id,
+        path=results_path, fresh=fresh,
+        experiment_id=experiment["experiment_id"],
         cohort_names=COHORT_NAMES, torch_seeds=TORCH_SEEDS,
+        experiment=experiment,
     )
 
 
@@ -433,7 +436,7 @@ def run_sweep(
     results, seeds_to_run = prepare_results(
         results_path,
         args.fresh,
-        metadata["experiment_id"],
+        metadata,
     )
 
     for torch_seed in seeds_to_run:

@@ -21,6 +21,7 @@ from experiment_utils import (
     experiment_metadata,
     normalize_split,
     prepare_results_file,
+    seed_everything,
 )
 from cnn_2 import (
     CNNClassifier3D,
@@ -200,7 +201,7 @@ def train_model_once(
         patient for name in source_cohorts for patient in cohort_val[name]
     ]
 
-    torch.manual_seed(
+    seed_everything(
         torch_seed
     )
 
@@ -353,7 +354,7 @@ def summarize(
 def prepare_results(
     results_path: Path,
     fresh: bool,
-    experiment_id: str,
+    experiment: dict,
 ) -> tuple[
     list[dict],
     list[int],
@@ -361,9 +362,10 @@ def prepare_results(
     return prepare_results_file(
         path=results_path,
         fresh=fresh,
-        experiment_id=experiment_id,
+        experiment_id=experiment["experiment_id"],
         cohort_names=COHORT_NAMES,
         torch_seeds=TORCH_SEEDS,
+        experiment=experiment,
     )
 
 
@@ -432,7 +434,7 @@ def run_sweep(
         prepare_results(
             results_path,
             args.fresh,
-            metadata["experiment_id"],
+            metadata,
         )
     )
 

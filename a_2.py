@@ -7,8 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-DATA_PATH          = "CUBES-Labelled-COHORTS"
-COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
+from experiment_utils import seed_everything
+DATA_PATH          = "CUBES-Labelled-COHORTS_2"
+COHORT_NAMES = ["AUGSBURG", "SWISS"]
 
 
 TARGET_COHORT = "SWISS"  # Target-touching pairs use pooled MMD.
@@ -52,7 +53,7 @@ class Decoder3D(nn.Module):
             nn.BatchNorm3d(16),
             nn.ReLU(inplace=True),
             nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.Identity(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -70,10 +71,25 @@ class HarmonizationModel(nn.Module):
         self.clf_dropout = nn.Dropout(p=0.2)
         self.aux_clf = nn.Linear(latent_dim, 1)
 
-    def forward(self, xs: list[torch.Tensor]):
-        zs = [self.encoder(x) for x in xs]
-        x_hats = [self.decoder(z) for z in zs]
-        return x_hats, zs
+    def forward(
+        self,
+        xs: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Process cohort batches together so shared BatchNorm is order-neutral."""
+        if not xs:
+            raise ValueError("At least one cohort batch is required.")
+        batch_sizes = [x.size(0) for x in xs]
+        z_all = self.encoder(torch.cat(xs, dim=0))
+        x_hat_all = self.decoder(z_all)
+        return list(x_hat_all.split(batch_sizes)), list(z_all.split(batch_sizes))
+
+    def reconstruct_cohorts(
+        self,
+        xs: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        names = list(xs)
+        x_hats, zs = self([xs[name] for name in names])
+        return dict(zip(names, x_hats)), dict(zip(names, zs))
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)
@@ -372,16 +388,17 @@ def train_harmonization(
 
         for batch_dict in _cycling_batches(train_loaders):
             optimizer.zero_grad()
-            zs, batch_labels = {}, {}
-            recon = torch.zeros((), device=device)
-
-            for name, (vol, label) in batch_dict.items():
-                vol = vol.to(device)
-                x_hat, z = model.reconstruct(vol)
-                recon = recon + F.mse_loss(x_hat, vol)
-                zs[name] = z
-
-
+            volumes = {
+                name: vol.to(device)
+                for name, (vol, _) in batch_dict.items()
+            }
+            x_hats, zs = model.reconstruct_cohorts(volumes)
+            recon = sum(
+                F.mse_loss(x_hats[name], volumes[name])
+                for name in volumes
+            )
+            batch_labels = {}
+            for name, (_, label) in batch_dict.items():
                 # Target labels never enter training.
                 if target_cohort is not None and name != target_cohort:
                     batch_labels[name] = label.to(device)
@@ -620,18 +637,22 @@ def alternating_classifier_finetune(
             model.decoder.eval()
             for batch_dict in _cycling_batches(train_loaders):
                 optimizer.zero_grad()
-                zs, batch_labels = {}, {}
-                recon = torch.zeros((), device=device)
+                volumes = {
+                    name: vol.to(device)
+                    for name, (vol, _) in batch_dict.items()
+                }
+                x_hats, zs = model.reconstruct_cohorts(volumes)
+                recon = sum(
+                    F.mse_loss(x_hats[name], volumes[name])
+                    for name in volumes
+                )
+                batch_labels = {}
                 clf_loss = torch.zeros((), device=device)
-                for name, (vol, label) in batch_dict.items():
-                    vol = vol.to(device)
-                    x_hat, z = model.reconstruct(vol)
-                    recon = recon + F.mse_loss(x_hat, vol)
-                    zs[name] = z
+                for name, (_, label) in batch_dict.items():
                     if name != target_cohort:
                         label = label.to(device)
                         batch_labels[name] = label
-                        logit = model.classify(z)
+                        logit = model.classify(zs[name])
                         clf_loss = clf_loss + F.binary_cross_entropy_with_logits(
                             logit.float(), label.float(), pos_weight=pos_weight
                         )
@@ -735,7 +756,7 @@ if __name__ == "__main__":
         cohort_train[name] = train_p
         cohort_val[name] = val_p
         print(f"{name:12s}: {len(train_p)} train / {len(val_p)} val  (all {len(patients)} used)")
-    torch.manual_seed(41)
+    seed_everything(41)
     model = HarmonizationModel(latent_dim=64)
     checkpoint_name = f"best_harmonization_multi_target-{TARGET_COHORT or 'none'}.pt"
     model = train_harmonization(

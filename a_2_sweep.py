@@ -21,6 +21,7 @@ from experiment_utils import (
     experiment_metadata,
     normalize_split,
     prepare_results_file,
+    seed_everything,
 )
 from a_2 import (
     HarmonizationModel,
@@ -198,7 +199,7 @@ def train_model_once(
             target_heldout=target_heldout,
         )
 
-    torch.manual_seed(torch_seed)
+    seed_everything(torch_seed)
 
     model = HarmonizationModel(latent_dim=LATENT_DIM)
 
@@ -369,6 +370,7 @@ if __name__ == "__main__":
         experiment_id=metadata["experiment_id"],
         cohort_names=COHORT_NAMES,
         torch_seeds=TORCH_SEEDS,
+        experiment=metadata,
     )
 
     for torch_seed in seeds_to_run:

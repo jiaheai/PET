@@ -17,7 +17,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 
-DATA_PATH = "CUBES-Labelled-COHORTS"
+DATA_PATH = "CUBES-Labelled-COHORTS_3"
 COHORT_NAMES = ["AUGSBURG", "PRE-RAPID", "SWISS"]
 
 

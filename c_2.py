@@ -62,7 +62,7 @@ class Decoder3D(nn.Module):
             nn.ReLU(inplace=True),
 
             nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.Identity(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
